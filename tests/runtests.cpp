@@ -3,6 +3,7 @@
 
 #include "richter/model.h"
 #include "richter/wavelet.h"
+#include "richter/boundary.h"
 #include "richter/config.h"
 #include <cstdio>
 #include <cmath>
@@ -137,6 +138,54 @@ static bool test_ricker_wavelet() {
     return pass;
 }
 
+// ─── Test: Sponge Boundary Damping ──────────────────────────────────
+static bool test_sponge_boundary() {
+    printf("[TEST] Sponge boundary damping... ");
+
+    const int N = 64;
+    const int sponge_width = 10;
+    const float damping_factor = 0.015f;
+    size_t total = (size_t)N * N * N;
+    size_t bytes = total * sizeof(float);
+
+    // Fill with 1.0 on device
+    std::vector<float> h_field(total, 1.0f);
+    float* d_field;
+    cudaMalloc(&d_field, bytes);
+    cudaMemcpy(d_field, h_field.data(), bytes, cudaMemcpyHostToDevice);
+
+    // Apply sponge
+    apply_sponge_boundary(d_field, N, N, N, sponge_width, damping_factor);
+    cudaDeviceSynchronize();
+
+    // Copy back
+    cudaMemcpy(h_field.data(), d_field, bytes, cudaMemcpyDeviceToHost);
+    cudaFree(d_field);
+
+    // Center should be untouched (1.0)
+    int center = (N/2) * N * N + (N/2) * N + (N/2);
+    bool center_ok = (fabsf(h_field[center] - 1.0f) < 1e-6f);
+
+    // Corner (0,0,0) should be heavily damped (< 1.0)
+    bool corner_ok = (h_field[0] < 0.99f);
+
+    // Edge midpoint should be somewhat damped
+    int edge_pt = 0 * N * N + (N/2) * N + (N/2);  // z=0, centered in XY
+    bool edge_ok = (h_field[edge_pt] < 0.99f);
+
+    bool pass = center_ok && corner_ok && edge_ok;
+    if (pass) {
+        printf("PASS (center=%.4f, corner=%.6f, edge=%.6f)\n",
+               h_field[center], h_field[0], h_field[edge_pt]);
+    } else {
+        printf("FAIL (center=%.4f [%s], corner=%.6f [%s], edge=%.6f [%s])\n",
+               h_field[center], center_ok ? "ok" : "BAD",
+               h_field[0], corner_ok ? "ok" : "BAD",
+               h_field[edge_pt], edge_ok ? "ok" : "BAD");
+    }
+    return pass;
+}
+
 // ─── Main ───────────────────────────────────────────────────────────
 int main() {
     printf("═══════════════════════════════════════\n");
@@ -147,6 +196,7 @@ int main() {
 
     total++; if (test_ricker_wavelet())  passed++;
     total++; if (test_naive_vs_cpu())    passed++;
+    total++; if (test_sponge_boundary()) passed++;
 
     printf("\n─── Results: %d/%d passed ───\n", passed, total);
     return (passed == total) ? 0 : 1;

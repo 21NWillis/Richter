@@ -17,12 +17,12 @@ set(KERNEL_SOURCES
     src/kernels/hello_naive.cu
     src/kernels/hello_shmem.cu
     src/kernels/hello_register.cu
+    src/boundary.cu
 )
 
 set(CORE_SOURCES
     src/model.cpp
     src/wavelet.cpp
-    src/boundary.cpp
 )
 
 # ─── Static library: richter_core ────────────────────────────────────
@@ -56,3 +56,7 @@ target_link_libraries(runtests PRIVATE richter_core)
 # ─── Benchmark executable ───────────────────────────────────────────
 add_executable(benchmark benchmarks/benchmark.cpp)
 target_link_libraries(benchmark PRIVATE richter_core)
+
+# ─── Snapshot tool (visualization) ──────────────────────────────────
+add_executable(snapshot tools/snapshot.cpp)
+target_link_libraries(snapshot PRIVATE richter_core)

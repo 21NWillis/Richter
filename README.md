@@ -57,6 +57,14 @@ Grid: 512^3 | GPU: RTX 3070
 | RegRot Sliding Window | — | — | — |
 | OpenAI Triton | — | — | — |
 
+## Wavefront Validation
+
+XY slice through a 512³ grid at z=128, t=200 (point source at center, uniform velocity 2000 m/s):
+
+![Circular wavefront expanding from center source](docs/images/wavefront_512.png)
+
+Concentric red/blue rings are the positive (compression) and negative (rarefaction) phases of the Ricker wavelet propagating outward. No edge reflections visible means the sponge absorbing boundary condition is working correctly.
+
 ## Roadmap
 
 | Phase | Focus | Status |

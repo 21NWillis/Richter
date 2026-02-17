@@ -77,7 +77,11 @@ void richter_forward(const Grid& grid, const Source& src,
                 break;
         }
 
-        // 3. Rotate buffers: prev ← curr, curr ← next
+        // 3. Apply absorbing boundary condition
+        apply_sponge_boundary(state.d_u_next, grid.nx, grid.ny, grid.nz,
+                              20, 0.015f);
+
+        // 4. Rotate buffers: prev ← curr, curr ← next
         float* tmp     = state.d_u_prev;
         state.d_u_prev = state.d_u_curr;
         state.d_u_curr = state.d_u_next;
