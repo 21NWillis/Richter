@@ -99,7 +99,12 @@ int main(int argc, char** argv) {
     printf("%-20s %10.3f %10.1f GB/s %8.1f%%\n",
            result.name, result.gpts_per_sec, result.effective_bw_gb, result.pct_peak);
 
-    // TODO: Add shared-memory and register-rotation kernels once implemented
+    auto shmem_result = run_benchmark("Shared Memory", launch_kernel_shmem,
+                                 N, N, N, warmup, iters, peak_bw);
+    printf("%-20s %10.3f %10.1f GB/s %8.1f%%\n",
+           shmem_result.name, shmem_result.gpts_per_sec, shmem_result.effective_bw_gb, shmem_result.pct_peak);
+
+    // TODO: Add register-rotation kernel once implemented
 
     printf("\n");
     return 0;

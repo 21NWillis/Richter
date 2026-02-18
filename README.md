@@ -52,10 +52,13 @@ Grid: 512^3 | GPU: RTX 3070
 | Implementation | GPts/s | Effective BW | % Peak BW |
 |----------------|--------|-------------|-----------|
 | Devito (Auto-tuned) | — | — | — |
-| Naive Kernel | 4.47 | 71.6 GB/s | 15.9% |
-| SHMem 2.5D Tiling | — | — | — |
+| Naive Kernel | 8.018 | 128.3 GB/s | 28.6% |
+| SHMem 2.5D Tiling | 8.080 | 129.3 GB/s | 28.9% |
 | RegRot Sliding Window | — | — | — |
 | OpenAI Triton | — | — | — |
+
+*Shared Memory 2.5D Tiling is roughly the same speed as the naive kernel. This is primarily because the L2 cache is effectively handling the memory access patterns of the naive kernel. Because of this, the overhead introduced by shared memory loading and thread syncing basically cancels out any potential gains.*
+
 
 ## Wavefront Validation
 
@@ -69,8 +72,8 @@ Concentric red/blue rings are the positive (compression) and negative (rarefacti
 
 | Phase | Focus | Status |
 |-------|-------|--------|
-| 1 | Infrastructure & Correctness (Naive kernel, wavelet, validation) | In Progress |
-| 2 | Optimization (Shared memory, register rotation) | Planned |
+| 1 | Infrastructure & Correctness (Naive kernel, wavelet, validation) | Complete |
+| 2 | Optimization (Shared memory, register rotation) | In Progress |
 | 3 | Data & Benchmarking (SEG-Y, roofline analysis) | Planned |
 | 4 | Polish (Triton experiment, Python API, documentation) | Planned |
 
