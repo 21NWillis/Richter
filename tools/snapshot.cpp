@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
 
     // ─── Run simulation ─────────────────────────────────────────────
     printf("Running %d timesteps...\n", nt);
-    richter_forward(grid, src, state, KernelType::SHARED_MEMORY);
+    richter_forward(grid, src, state, KernelType::REGISTER_ROT);
     cudaDeviceSynchronize();
     printf("Done.\n\n");
 

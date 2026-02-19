@@ -75,6 +75,11 @@ void richter_forward(const Grid& grid, const Source& src,
                                        state.d_u_next, state.d_vel,
                                        grid.nx, grid.ny, grid.nz);
                 break;
+            case KernelType::HYBRID:
+                launch_kernel_hybrid(state.d_u_prev, state.d_u_curr,
+                                     state.d_u_next, state.d_vel,
+                                     grid.nx, grid.ny, grid.nz);
+                break;
         }
 
         // 3. Apply absorbing boundary condition

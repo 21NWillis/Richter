@@ -18,3 +18,8 @@ void launch_kernel_shmem(const float* u_prev, const float* u_curr,
 void launch_kernel_register(const float* u_prev, const float* u_curr,
                             float* u_next, const float* vel,
                             int nx, int ny, int nz);
+
+/// Hybrid — shared memory XY tiling + register rotation Z.
+void launch_kernel_hybrid(const float* u_prev, const float* u_curr,
+                          float* u_next, const float* vel,
+                          int nx, int ny, int nz);

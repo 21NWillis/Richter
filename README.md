@@ -54,10 +54,19 @@ Grid: 512^3 | GPU: RTX 3070
 | Devito (Auto-tuned) | — | — | — |
 | Naive Kernel | 8.018 | 128.3 GB/s | 28.6% |
 | SHMem 2.5D Tiling | 8.080 | 129.3 GB/s | 28.9% |
-| RegRot Sliding Window | — | — | — |
+| RegRot Sliding Window | 16.5 | 264.9 GB/s | 59.1% |
 | OpenAI Triton | — | — | — |
 
 *Shared Memory 2.5D Tiling is roughly the same speed as the naive kernel. This is primarily because the L2 cache is effectively handling the memory access patterns of the naive kernel. Because of this, the overhead introduced by shared memory loading and thread syncing basically cancels out any potential gains.*
+
+**Register Rotation Performance:** This kernel hits **~93% Hardware Bus Utilization** (416 GB/s), meaning the memory bandwidth is fully saturated. 
+
+The reported "59% Efficiency" reflects the **algorithmic overhead** of halo data transfers:
+- **Ideal:** The benchmark assumes we only need to move 16 bytes/point.
+- **Actual:** We physically move ~25 bytes/point because we must re-load neighbor (halo) data that falls out of L2 cache.
+- **Result** Some of the data movement is redundant, and only ~64% of the data moved is actually used in the computation. 64% x 93% = 59% efficiency. 
+
+**2x Total Speedup**
 
 
 ## Wavefront Validation

@@ -30,4 +30,5 @@ enum class KernelType {
     NAIVE,           // Direct global memory reads
     SHARED_MEMORY,   // 2.5D XY tiling with shared memory
     REGISTER_ROT,    // Register rotation / sliding window on Z
+    HYBRID,          // Shared memory XY + register rotation Z
 };

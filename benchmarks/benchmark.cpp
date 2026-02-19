@@ -104,7 +104,15 @@ int main(int argc, char** argv) {
     printf("%-20s %10.3f %10.1f GB/s %8.1f%%\n",
            shmem_result.name, shmem_result.gpts_per_sec, shmem_result.effective_bw_gb, shmem_result.pct_peak);
 
-    // TODO: Add register-rotation kernel once implemented
+    auto reg_result = run_benchmark("Register Rotation", launch_kernel_register,
+                                 N, N, N, warmup, iters, peak_bw);
+    printf("%-20s %10.3f %10.1f GB/s %8.1f%%\n",
+           reg_result.name, reg_result.gpts_per_sec, reg_result.effective_bw_gb, reg_result.pct_peak);
+
+    auto hybrid_result = run_benchmark("Hybrid (Shmem+Reg)", launch_kernel_hybrid,
+                                 N, N, N, warmup, iters, peak_bw);
+    printf("%-20s %10.3f %10.1f GB/s %8.1f%%\n",
+           hybrid_result.name, hybrid_result.gpts_per_sec, hybrid_result.effective_bw_gb, hybrid_result.pct_peak);
 
     printf("\n");
     return 0;

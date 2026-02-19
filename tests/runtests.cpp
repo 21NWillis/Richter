@@ -165,6 +165,66 @@ static bool test_shmem_vs_cpu() {
     }
 }
 
+// ─── Test: Register Rotation Kernel vs CPU ──────────────────────────
+static bool test_register_vs_cpu() {
+    printf("[TEST] Register rotation kernel vs CPU reference... ");
+
+    const int N = 64;
+    Grid grid = { N, N, N, DEFAULT_DX, DEFAULT_DX, DEFAULT_DX, DEFAULT_DT, 1 };
+    size_t total = grid.total_points();
+
+    std::vector<float> h_prev(total, 0.0f);
+    std::vector<float> h_curr(total, 0.0f);
+    std::vector<float> h_vel(total, 0.0f);
+    std::vector<float> h_cpu_out(total, 0.0f);
+    std::vector<float> h_gpu_out(total, 0.0f);
+
+    float coeff = DEFAULT_VELOCITY * DEFAULT_VELOCITY * DEFAULT_DT * DEFAULT_DT
+                / (DEFAULT_DX * DEFAULT_DX);
+    for (size_t i = 0; i < total; i++) {
+        h_curr[i] = sinf((float)i * 0.001f);
+        h_prev[i] = h_curr[i] * 0.99f;
+        h_vel[i]  = coeff;
+    }
+
+    cpu_stencil(h_prev.data(), h_curr.data(), h_cpu_out.data(),
+                h_vel.data(), N, N, N);
+
+    float *d_prev, *d_curr, *d_next, *d_vel;
+    size_t bytes = total * sizeof(float);
+    cudaMalloc(&d_prev, bytes);
+    cudaMalloc(&d_curr, bytes);
+    cudaMalloc(&d_next, bytes);
+    cudaMalloc(&d_vel,  bytes);
+
+    cudaMemcpy(d_prev, h_prev.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_curr, h_curr.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemset(d_next, 0, bytes);
+    cudaMemcpy(d_vel,  h_vel.data(),  bytes, cudaMemcpyHostToDevice);
+
+    launch_kernel_register(d_prev, d_curr, d_next, d_vel, N, N, N);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(h_gpu_out.data(), d_next, bytes, cudaMemcpyDeviceToHost);
+
+    float max_err = 0.0f;
+    for (size_t i = 0; i < total; i++) {
+        float err = fabsf(h_gpu_out[i] - h_cpu_out[i]);
+        if (err > max_err) max_err = err;
+    }
+
+    cudaFree(d_prev); cudaFree(d_curr);
+    cudaFree(d_next); cudaFree(d_vel);
+
+    if (max_err < 1e-4f) {
+        printf("PASS (max error: %.2e)\n", max_err);
+        return true;
+    } else {
+        printf("FAIL (max error: %.2e)\n", max_err);
+        return false;
+    }
+}
+
 // ─── Test: Ricker Wavelet ───────────────────────────────────────────
 static bool test_ricker_wavelet() {
     printf("[TEST] Ricker wavelet generation... ");
@@ -246,6 +306,66 @@ static bool test_sponge_boundary() {
     return pass;
 }
 
+// ─── Test: Hybrid Kernel vs CPU ─────────────────────────────────────
+static bool test_hybrid_vs_cpu() {
+    printf("[TEST] Hybrid (shmem+register) kernel vs CPU reference... ");
+
+    const int N = 64;
+    Grid grid = { N, N, N, DEFAULT_DX, DEFAULT_DX, DEFAULT_DX, DEFAULT_DT, 1 };
+    size_t total = grid.total_points();
+
+    std::vector<float> h_prev(total, 0.0f);
+    std::vector<float> h_curr(total, 0.0f);
+    std::vector<float> h_vel(total, 0.0f);
+    std::vector<float> h_cpu_out(total, 0.0f);
+    std::vector<float> h_gpu_out(total, 0.0f);
+
+    float coeff = DEFAULT_VELOCITY * DEFAULT_VELOCITY * DEFAULT_DT * DEFAULT_DT
+                / (DEFAULT_DX * DEFAULT_DX);
+    for (size_t i = 0; i < total; i++) {
+        h_curr[i] = sinf((float)i * 0.001f);
+        h_prev[i] = h_curr[i] * 0.99f;
+        h_vel[i]  = coeff;
+    }
+
+    cpu_stencil(h_prev.data(), h_curr.data(), h_cpu_out.data(),
+                h_vel.data(), N, N, N);
+
+    float *d_prev, *d_curr, *d_next, *d_vel;
+    size_t bytes = total * sizeof(float);
+    cudaMalloc(&d_prev, bytes);
+    cudaMalloc(&d_curr, bytes);
+    cudaMalloc(&d_next, bytes);
+    cudaMalloc(&d_vel,  bytes);
+
+    cudaMemcpy(d_prev, h_prev.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_curr, h_curr.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemset(d_next, 0, bytes);
+    cudaMemcpy(d_vel,  h_vel.data(),  bytes, cudaMemcpyHostToDevice);
+
+    launch_kernel_hybrid(d_prev, d_curr, d_next, d_vel, N, N, N);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(h_gpu_out.data(), d_next, bytes, cudaMemcpyDeviceToHost);
+
+    float max_err = 0.0f;
+    for (size_t i = 0; i < total; i++) {
+        float err = fabsf(h_gpu_out[i] - h_cpu_out[i]);
+        if (err > max_err) max_err = err;
+    }
+
+    cudaFree(d_prev); cudaFree(d_curr);
+    cudaFree(d_next); cudaFree(d_vel);
+
+    if (max_err < 1e-4f) {
+        printf("PASS (max error: %.2e)\n", max_err);
+        return true;
+    } else {
+        printf("FAIL (max error: %.2e)\n", max_err);
+        return false;
+    }
+}
+
 // ─── Main ───────────────────────────────────────────────────────────
 int main() {
     printf("═══════════════════════════════════════\n");
@@ -257,6 +377,8 @@ int main() {
     total++; if (test_ricker_wavelet())  passed++;
     total++; if (test_naive_vs_cpu())    passed++;
     total++; if (test_shmem_vs_cpu())    passed++;
+    total++; if (test_register_vs_cpu()) passed++;
+    total++; if (test_hybrid_vs_cpu())   passed++;
     total++; if (test_sponge_boundary()) passed++;
 
     printf("\n─── Results: %d/%d passed ───\n", passed, total);

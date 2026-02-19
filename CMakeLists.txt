@@ -17,6 +17,7 @@ set(KERNEL_SOURCES
     src/kernels/hello_naive.cu
     src/kernels/hello_shmem.cu
     src/kernels/hello_register.cu
+    src/kernels/hello_hybrid.cu
     src/boundary.cu
 )
 
@@ -36,7 +37,7 @@ target_include_directories(richter_core PUBLIC
 )
 
 target_compile_options(richter_core PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -O3 --use_fast_math>
 )
 
 # ─── PyBind11 module (optional, only if pybind11 found) ──────────────
@@ -60,3 +61,10 @@ target_link_libraries(benchmark PRIVATE richter_core)
 # ─── Snapshot tool (visualization) ──────────────────────────────────
 add_executable(snapshot tools/snapshot.cpp)
 target_link_libraries(snapshot PRIVATE richter_core)
+
+# ─── Profiling target (standalone for NCU) ──────────────────────────
+add_executable(profile_register tools/profile_kernel.cu)
+target_compile_options(profile_register PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -lineinfo>
+)
+target_include_directories(profile_register PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
