@@ -21,12 +21,15 @@ struct Source {
 };
 
 // ─── Device Buffers ─────────────────────────────────────────────────
+#include "richter/cuda_buffer.h"
+
+// ─── Device Buffers ─────────────────────────────────────────────────
 struct DeviceState {
-    float* d_u_prev;       // u(t-1)  — previous time step
-    float* d_u_curr;       // u(t)    — current time step
-    float* d_u_next;       // u(t+1)  — next time step (output)
-    float* d_vel;          // velocity model (v^2 * dt^2 / dx^2 precomputed)
-    float* d_wavelet;      // source wavelet on device
+    CudaBuffer<float> d_u_prev;       // u(t-1)  — previous time step
+    CudaBuffer<float> d_u_curr;       // u(t)    — current time step
+    CudaBuffer<float> d_u_next;       // u(t+1)  — next time step (output)
+    CudaBuffer<float> d_vel;          // velocity model (v^2 * dt^2 / dx^2 precomputed)
+    CudaBuffer<float> d_wavelet;      // source wavelet on device
 };
 
 // ─── Public API ─────────────────────────────────────────────────────

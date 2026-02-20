@@ -91,7 +91,7 @@ int main(int argc, char** argv) {
     richter_init(grid, src, state);
 
     // Upload velocity model
-    cudaMemcpy(state.d_vel, h_vel.data(), grid.bytes(), cudaMemcpyHostToDevice);
+    state.d_vel.copyFromHost(h_vel.data(), grid.total_points());
 
     // ─── Run simulation ─────────────────────────────────────────────
     printf("Running %d timesteps...\n", nt);

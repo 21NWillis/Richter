@@ -20,21 +20,20 @@
 } while(0)
 
 void richter_init(const Grid& grid, const Source& src, DeviceState& state) {
-    size_t bytes = grid.bytes();
+    size_t count = grid.total_points();
 
-    CUDA_CHECK(cudaMalloc(&state.d_u_prev, bytes));
-    CUDA_CHECK(cudaMalloc(&state.d_u_curr, bytes));
-    CUDA_CHECK(cudaMalloc(&state.d_u_next, bytes));
-    CUDA_CHECK(cudaMalloc(&state.d_vel,    bytes));
+    state.d_u_prev = CudaBuffer<float>(count);
+    state.d_u_curr = CudaBuffer<float>(count);
+    state.d_u_next = CudaBuffer<float>(count);
+    state.d_vel    = CudaBuffer<float>(count);
 
-    CUDA_CHECK(cudaMemset(state.d_u_prev, 0, bytes));
-    CUDA_CHECK(cudaMemset(state.d_u_curr, 0, bytes));
-    CUDA_CHECK(cudaMemset(state.d_u_next, 0, bytes));
+    state.d_u_prev.zero();
+    state.d_u_curr.zero();
+    state.d_u_next.zero();
 
     // Upload wavelet
-    CUDA_CHECK(cudaMalloc(&state.d_wavelet, grid.nt * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(state.d_wavelet, src.wavelet,
-                          grid.nt * sizeof(float), cudaMemcpyHostToDevice));
+    state.d_wavelet = CudaBuffer<float>(grid.nt);
+    state.d_wavelet.copyFromHost(src.wavelet, grid.nt);
 }
 
 /// Inject source at a single grid point via host round-trip.
@@ -44,10 +43,12 @@ static void inject_source(const Grid& grid, const Source& src,
 {
     int idx = src.sz * grid.nx * grid.ny + src.sy * grid.nx + src.sx;
     float val;
-    CUDA_CHECK(cudaMemcpy(&val, state.d_u_curr + idx,
+    
+
+    CUDA_CHECK(cudaMemcpy(&val, state.d_u_curr.data() + idx,
                           sizeof(float), cudaMemcpyDeviceToHost));
     val += src.wavelet[t];
-    CUDA_CHECK(cudaMemcpy(state.d_u_curr + idx, &val,
+    CUDA_CHECK(cudaMemcpy(state.d_u_curr.data() + idx, &val,
                           sizeof(float), cudaMemcpyHostToDevice));
 }
 
@@ -61,51 +62,57 @@ void richter_forward(const Grid& grid, const Source& src,
         // 2. Dispatch stencil kernel
         switch (kernel) {
             case KernelType::NAIVE:
-                launch_kernel_naive(state.d_u_prev, state.d_u_curr,
-                                    state.d_u_next, state.d_vel,
+                launch_kernel_naive(state.d_u_prev.data(), state.d_u_curr.data(),
+                                    state.d_u_next.data(), state.d_vel.data(),
                                     grid.nx, grid.ny, grid.nz);
                 break;
             case KernelType::SHARED_MEMORY:
-                launch_kernel_shmem(state.d_u_prev, state.d_u_curr,
-                                    state.d_u_next, state.d_vel,
+                launch_kernel_shmem(state.d_u_prev.data(), state.d_u_curr.data(),
+                                    state.d_u_next.data(), state.d_vel.data(),
                                     grid.nx, grid.ny, grid.nz);
                 break;
             case KernelType::REGISTER_ROT:
-                launch_kernel_register(state.d_u_prev, state.d_u_curr,
-                                       state.d_u_next, state.d_vel,
+                launch_kernel_register(state.d_u_prev.data(), state.d_u_curr.data(),
+                                       state.d_u_next.data(), state.d_vel.data(),
                                        grid.nx, grid.ny, grid.nz);
                 break;
             case KernelType::HYBRID:
-                launch_kernel_hybrid(state.d_u_prev, state.d_u_curr,
-                                     state.d_u_next, state.d_vel,
+                launch_kernel_hybrid(state.d_u_prev.data(), state.d_u_curr.data(),
+                                     state.d_u_next.data(), state.d_vel.data(),
                                      grid.nx, grid.ny, grid.nz);
                 break;
         }
 
         // 3. Apply absorbing boundary condition
-        apply_sponge_boundary(state.d_u_next, grid.nx, grid.ny, grid.nz,
+        apply_sponge_boundary(state.d_u_next.data(), grid.nx, grid.ny, grid.nz,
                               20, 0.015f);
 
         // 4. Rotate buffers: prev ← curr, curr ← next
-        float* tmp     = state.d_u_prev;
-        state.d_u_prev = state.d_u_curr;
-        state.d_u_curr = state.d_u_next;
-        state.d_u_next = tmp;
+        // Use swap to rotate
+        state.d_u_prev.swap(state.d_u_curr);
+        state.d_u_curr.swap(state.d_u_next);
+        // After this: prev has old curr, curr has old next. 
+        // Logic check:
+        // Original: tmp=prev, prev=curr, curr=next, next=tmp
+        // My swap:
+        // prev <-> curr : prev(new)=old_curr, curr(new)=old_prev
+        // curr <-> next : curr(new)=old_next, next(new)=curr(new)=old_prev
+        // Result: prev=old_curr, curr=old_next, next=old_prev. 
+        // Matches original logic!
     }
 }
 
 void richter_snapshot(const Grid& grid, const DeviceState& state,
                       float* h_output)
 {
-    CUDA_CHECK(cudaMemcpy(h_output, state.d_u_curr,
-                          grid.bytes(), cudaMemcpyDeviceToHost));
+    state.d_u_curr.copyToHost(h_output, grid.total_points());
 }
 
 void richter_cleanup(DeviceState& state) {
-    cudaFree(state.d_u_prev);
-    cudaFree(state.d_u_curr);
-    cudaFree(state.d_u_next);
-    cudaFree(state.d_vel);
-    cudaFree(state.d_wavelet);
-    memset(&state, 0, sizeof(state));
+
+    state.d_u_prev = CudaBuffer<float>();
+    state.d_u_curr = CudaBuffer<float>();
+    state.d_u_next = CudaBuffer<float>();
+    state.d_vel    = CudaBuffer<float>();
+    state.d_wavelet = CudaBuffer<float>();
 }

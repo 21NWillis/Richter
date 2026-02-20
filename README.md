@@ -71,7 +71,7 @@ The reported "59% Efficiency" reflects the **algorithmic overhead** of halo data
 
 ## Wavefront Validation
 
-XY slice through a 512³ grid at z=128, t=200 (point source at center, uniform velocity 2000 m/s):
+XY slice through a 512³ grid:
 
 ![Circular wavefront expanding from center source](docs/images/wavefront_512.png)
 

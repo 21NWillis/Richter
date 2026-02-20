@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include "richter/cuda_buffer.h"
 
 struct BenchResult {
     const char* name;
@@ -27,19 +28,19 @@ static BenchResult run_benchmark(const char* name,
     size_t total = (size_t)nx * ny * nz;
     size_t bytes = total * sizeof(float);
 
-    float *d_prev, *d_curr, *d_next, *d_vel;
-    cudaMalloc(&d_prev, bytes);
-    cudaMalloc(&d_curr, bytes);
-    cudaMalloc(&d_next, bytes);
-    cudaMalloc(&d_vel,  bytes);
-    cudaMemset(d_prev, 0, bytes);
-    cudaMemset(d_curr, 0, bytes);
-    cudaMemset(d_next, 0, bytes);
-    cudaMemset(d_vel,  0, bytes);
+    CudaBuffer<float> d_prev(total);
+    CudaBuffer<float> d_curr(total);
+    CudaBuffer<float> d_next(total);
+    CudaBuffer<float> d_vel(total);
+
+    d_prev.zero();
+    d_curr.zero();
+    d_next.zero();
+    d_vel.zero();
 
     // Warmup
     for (int i = 0; i < warmup; i++) {
-        launcher(d_prev, d_curr, d_next, d_vel, nx, ny, nz);
+        launcher(d_prev.data(), d_curr.data(), d_next.data(), d_vel.data(), nx, ny, nz);
     }
     cudaDeviceSynchronize();
 
@@ -50,7 +51,7 @@ static BenchResult run_benchmark(const char* name,
 
     cudaEventRecord(start);
     for (int i = 0; i < iters; i++) {
-        launcher(d_prev, d_curr, d_next, d_vel, nx, ny, nz);
+        launcher(d_prev.data(), d_curr.data(), d_next.data(), d_vel.data(), nx, ny, nz);
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
@@ -69,8 +70,7 @@ static BenchResult run_benchmark(const char* name,
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
-    cudaFree(d_prev); cudaFree(d_curr);
-    cudaFree(d_next); cudaFree(d_vel);
+    // Destructors handle cudaFree
 
     return { name, gpts, eff_bw, pct };
 }
