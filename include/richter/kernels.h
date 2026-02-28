@@ -19,7 +19,7 @@ void launch_kernel_register(const float* u_prev, const float* u_curr,
                             float* u_next, const float* vel,
                             int nx, int ny, int nz);
 
-/// Hybrid — shared memory XY tiling + register rotation Z.
+/// Hybrid — shared memory XY tiling + register rotation Z. NOT EFFECTIVE.
 void launch_kernel_hybrid(const float* u_prev, const float* u_curr,
                           float* u_next, const float* vel,
                           int nx, int ny, int nz);

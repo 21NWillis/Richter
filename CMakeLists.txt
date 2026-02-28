@@ -19,11 +19,14 @@ set(KERNEL_SOURCES
     src/kernels/hello_register.cu
     src/kernels/hello_hybrid.cu
     src/boundary.cu
+    src/receiver.cu
+    src/imaging.cu
 )
 
 set(CORE_SOURCES
     src/model.cpp
     src/wavelet.cpp
+    src/rtm.cpp
 )
 
 # ─── Static library: richter_core ────────────────────────────────────
@@ -61,6 +64,10 @@ target_link_libraries(benchmark PRIVATE richter_core)
 # ─── Snapshot tool (visualization) ──────────────────────────────────
 add_executable(snapshot tools/snapshot.cpp)
 target_link_libraries(snapshot PRIVATE richter_core)
+
+# ─── RTM demo ───────────────────────────────────────────────────────
+add_executable(rtm_demo tools/rtm_demo.cpp)
+target_link_libraries(rtm_demo PRIVATE richter_core)
 
 # ─── Profiling target (standalone for NCU) ──────────────────────────
 add_executable(profile_register tools/profile_kernel.cu)

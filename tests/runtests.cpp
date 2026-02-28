@@ -11,6 +11,7 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include "richter/kernels.h"
+#include "richter/rtm.h"
 
 // ─── CPU Reference: Naive 3D FDTD Stencil ──────────────────────────
 static void cpu_stencil(const float* u_prev, const float* u_curr,
@@ -366,6 +367,82 @@ static bool test_hybrid_vs_cpu() {
     }
 }
 
+// ─── Test: RTM Flat Reflector ───────────────────────────────────────
+// Smoke test: verify the RTM pipeline runs end-to-end without errors,
+// produces a non-zero image, and doesn't diverge (no NaN/Inf).
+static bool test_rtm_flat_reflector() {
+    printf("[TEST] RTM flat reflector imaging... ");
+
+    const int N  = 48;
+    const int reflector_z = 30;
+
+    float dx = DEFAULT_DX;
+    float dt = DEFAULT_DT;
+    float freq = 15.0f;
+    float v1 = 2000.0f, v2 = 2800.0f;
+
+    int sponge_width = N / 6;
+    int src_z = sponge_width + 2;
+
+    float grid_speed = v1 * dt / dx;
+    int round_trip = (int)(2.0f * (reflector_z - src_z) / grid_speed);
+    int nt = (int)(round_trip * 1.8f);
+
+    Grid grid = { N, N, N, dx, dx, dx, dt, nt };
+    size_t total = grid.total_points();
+
+    std::vector<float> h_vel(total);
+    for (int z = 0; z < N; z++) {
+        float v = (z < reflector_z) ? v1 : v2;
+        float coeff = v * v * dt * dt / (dx * dx);
+        for (int y = 0; y < N; y++)
+            for (int x = 0; x < N; x++)
+                h_vel[z * N * N + y * N + x] = coeff;
+    }
+
+    std::vector<float> h_wavelet(nt);
+    generate_ricker_wavelet(h_wavelet.data(), nt, dt, freq);
+    Source src = { N/2, N/2, src_z, freq, h_wavelet.data() };
+
+    int num_rec = N - 2 * sponge_width;
+    std::vector<int> rx(num_rec), ry(num_rec), rz(num_rec);
+    for (int i = 0; i < num_rec; i++) {
+        rx[i] = sponge_width + i;
+        ry[i] = N / 2;
+        rz[i] = src_z;
+    }
+    std::vector<float> traces(num_rec * nt, 0.0f);
+    ReceiverSet rec = { num_rec, rx.data(), ry.data(), rz.data(), traces.data() };
+
+    DeviceState state;
+    richter_init(grid, src, state);
+    state.d_vel.copyFromHost(h_vel.data(), total);
+
+    std::vector<float> h_image(total, 0.0f);
+    richter_rtm(grid, src, rec, state, h_image.data(),
+                KernelType::REGISTER_ROT, 50);
+
+    // Check: non-zero and no NaN/Inf
+    float max_amp = 0.0f;
+    bool has_nan = false;
+    for (size_t i = 0; i < total; i++) {
+        float v = h_image[i];
+        if (v != v) { has_nan = true; break; }  // NaN check
+        if (v < 0) v = -v;
+        if (v > max_amp) max_amp = v;
+    }
+
+    richter_cleanup(state);
+
+    if (!has_nan && max_amp > 0.0f && max_amp < 1e30f) {
+        printf("PASS (nt=%d, max_amp=%.2e, no NaN/Inf)\n", nt, max_amp);
+        return true;
+    } else {
+        printf("FAIL (nt=%d, max_amp=%.2e, nan=%d)\n", nt, max_amp, has_nan);
+        return false;
+    }
+}
+
 // ─── Main ───────────────────────────────────────────────────────────
 int main() {
     printf("═══════════════════════════════════════\n");
@@ -374,12 +451,13 @@ int main() {
 
     int passed = 0, total = 0;
 
-    total++; if (test_ricker_wavelet())  passed++;
-    total++; if (test_naive_vs_cpu())    passed++;
-    total++; if (test_shmem_vs_cpu())    passed++;
-    total++; if (test_register_vs_cpu()) passed++;
-    total++; if (test_hybrid_vs_cpu())   passed++;
-    total++; if (test_sponge_boundary()) passed++;
+    total++; if (test_ricker_wavelet())       passed++;
+    total++; if (test_naive_vs_cpu())         passed++;
+    total++; if (test_shmem_vs_cpu())         passed++;
+    total++; if (test_register_vs_cpu())      passed++;
+    total++; if (test_hybrid_vs_cpu())        passed++;
+    total++; if (test_sponge_boundary())      passed++;
+    total++; if (test_rtm_flat_reflector())   passed++;
 
     printf("\n─── Results: %d/%d passed ───\n", passed, total);
     return (passed == total) ? 0 : 1;

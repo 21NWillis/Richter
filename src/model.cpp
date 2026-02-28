@@ -88,17 +88,9 @@ void richter_forward(const Grid& grid, const Source& src,
                               20, 0.015f);
 
         // 4. Rotate buffers: prev ← curr, curr ← next
-        // Use swap to rotate
+
         state.d_u_prev.swap(state.d_u_curr);
         state.d_u_curr.swap(state.d_u_next);
-        // After this: prev has old curr, curr has old next. 
-        // Logic check:
-        // Original: tmp=prev, prev=curr, curr=next, next=tmp
-        // My swap:
-        // prev <-> curr : prev(new)=old_curr, curr(new)=old_prev
-        // curr <-> next : curr(new)=old_next, next(new)=curr(new)=old_prev
-        // Result: prev=old_curr, curr=old_next, next=old_prev. 
-        // Matches original logic!
     }
 }
 
