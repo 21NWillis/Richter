@@ -2,8 +2,10 @@
 // Reverse Time Migration: forward propagation with receiver recording,
 // backward propagation with receiver injection, and imaging condition.
 //
-// Strategy: save source wavefield snapshot to host at EVERY timestep.
-// This uses more host memory but guarantees correct time alignment.
+// Strategy: checkpoint-based. Save (u_prev, u_curr) every cp_interval
+// steps during forward pass. During backward pass, process one segment
+// at a time: restore checkpoint, re-propagate to regenerate source
+// snapshots, then walk backward applying the imaging condition.
 
 #include "richter/rtm.h"
 #include "richter/kernels.h"
@@ -14,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <algorithm>
 
 #define CUDA_CHECK(call) do {                                       \
     cudaError_t err = (call);                                       \
@@ -45,14 +48,63 @@ static void dispatch_stencil(const float* u_prev, const float* u_curr,
     }
 }
 
+// Helper: inject source (single-point additive). Host round-trip for simplicity.
+static void inject_source(CudaBuffer<float>& d_u, const Source& src,
+                           const Grid& grid, int t)
+{
+    int idx = src.sz * grid.nx * grid.ny + src.sy * grid.nx + src.sx;
+    float val;
+    CUDA_CHECK(cudaMemcpy(&val, d_u.data() + idx,
+                          sizeof(float), cudaMemcpyDeviceToHost));
+    val += src.wavelet[t];
+    CUDA_CHECK(cudaMemcpy(d_u.data() + idx, &val,
+                          sizeof(float), cudaMemcpyHostToDevice));
+}
+
+// Helper: one forward step (inject, stencil, sponge, rotate, record receivers)
+static void forward_step(DeviceState& state, const Grid& grid,
+                          const Source& src, int t, KernelType kernel,
+                          int sponge_width,
+                          CudaBuffer<float>* d_traces,
+                          CudaBuffer<int>* d_rx, CudaBuffer<int>* d_ry,
+                          CudaBuffer<int>* d_rz, int num_receivers)
+{
+    inject_source(state.d_u_curr, src, grid, t);
+
+    dispatch_stencil(state.d_u_prev.data(), state.d_u_curr.data(),
+                     state.d_u_next.data(), state.d_vel.data(),
+                     grid.nx, grid.ny, grid.nz, kernel);
+    apply_sponge_boundary(state.d_u_next.data(), grid.nx, grid.ny, grid.nz,
+                          sponge_width, 0.015f);
+
+    state.d_u_prev.swap(state.d_u_curr);
+    state.d_u_curr.swap(state.d_u_next);
+
+    if (d_traces) {
+        launch_record_receivers(state.d_u_curr.data(), d_traces->data(),
+                                d_rx->data(), d_ry->data(), d_rz->data(),
+                                num_receivers, grid.nx, grid.ny,
+                                t, grid.nt);
+    }
+}
+
+// Checkpoint: stores (u_prev, u_curr) at a given time step
+struct Checkpoint {
+    std::vector<float> h_u_prev;
+    std::vector<float> h_u_curr;
+    int time_step;
+};
+
 // richter_rtm
 void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
                  DeviceState& state, float* h_image, KernelType kernel,
-                 int /* checkpoint_interval */,
+                 int checkpoint_interval,
                  const float* h_vel_background)
 {
     size_t N = grid.total_points();
     size_t bytes = N * sizeof(float);
+    int sponge_width = (grid.nx < 64) ? grid.nx / 6 : 20;
+    int cp_interval = std::max(checkpoint_interval, 1);
 
     // Allocate device receiver buffers
     CudaBuffer<int> d_rx(rec.num_receivers);
@@ -71,53 +123,49 @@ void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
     d_image.zero();
     d_illum.zero();
 
-    printf("[RTM] Saving all %d source snapshots to host (%.1f MB total)\n",
-           grid.nt, (float)grid.nt * bytes / (1024.0f * 1024.0f));
+    int num_checkpoints = (grid.nt + cp_interval - 1) / cp_interval + 1;
 
-    // PHASE 1: FORWARD PROPAGATION — save every source snapshot
+    printf("[RTM] Checkpoint interval=%d, checkpoints=%d (%.1f MB total)\n",
+           cp_interval, num_checkpoints,
+           (float)num_checkpoints * 2 * bytes / (1024.0f * 1024.0f));
+
+    // PHASE 1: FORWARD PROPAGATION with checkpoint saving
     printf("[RTM] Forward propagation (%d steps)...\n", grid.nt);
 
-    std::vector<std::vector<float>> src_snapshots(grid.nt);
+    std::vector<Checkpoint> checkpoints(num_checkpoints);
 
     state.d_u_prev.zero();
     state.d_u_curr.zero();
     state.d_u_next.zero();
 
+    // Save initial checkpoint (t=0, before any steps)
+    checkpoints[0].h_u_prev.resize(N);
+    checkpoints[0].h_u_curr.resize(N);
+    checkpoints[0].time_step = 0;
+    CUDA_CHECK(cudaMemcpy(checkpoints[0].h_u_prev.data(), state.d_u_prev.data(),
+                          bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(checkpoints[0].h_u_curr.data(), state.d_u_curr.data(),
+                          bytes, cudaMemcpyDeviceToHost));
+
     for (int t = 0; t < grid.nt; t++) {
-        // Inject source at time t
-        int src_idx = src.sz * grid.nx * grid.ny + src.sy * grid.nx + src.sx;
-        float val;
-        CUDA_CHECK(cudaMemcpy(&val, state.d_u_curr.data() + src_idx,
-                              sizeof(float), cudaMemcpyDeviceToHost));
-        val += src.wavelet[t];
-        CUDA_CHECK(cudaMemcpy(state.d_u_curr.data() + src_idx, &val,
-                              sizeof(float), cudaMemcpyHostToDevice));
+        forward_step(state, grid, src, t, kernel, sponge_width,
+                     &d_traces, &d_rx, &d_ry, &d_rz, rec.num_receivers);
 
-        // Save source wavefield AFTER source injection, BEFORE stencil
-        src_snapshots[t].resize(N);
-        CUDA_CHECK(cudaMemcpy(src_snapshots[t].data(),
-                              state.d_u_curr.data(), bytes,
-                              cudaMemcpyDeviceToHost));
+        // Save checkpoint after every cp_interval steps
+        // Checkpoint at step t+1 stores the wavefield state AFTER step t completes
+        if ((t + 1) % cp_interval == 0 || t == grid.nt - 1) {
+            int cp_idx = (t + 1) / cp_interval;
+            if (t == grid.nt - 1 && (t + 1) % cp_interval != 0)
+                cp_idx = num_checkpoints - 1;
 
-        // Stencil
-        dispatch_stencil(state.d_u_prev.data(), state.d_u_curr.data(),
-                         state.d_u_next.data(), state.d_vel.data(),
-                         grid.nx, grid.ny, grid.nz, kernel);
-
-        // Absorbing boundary
-        int sponge_width = (grid.nx < 64) ? grid.nx / 6 : 20;
-        apply_sponge_boundary(state.d_u_next.data(), grid.nx, grid.ny, grid.nz,
-                              sponge_width, 0.015f);
-
-        // Rotate: prev←curr, curr←next
-        state.d_u_prev.swap(state.d_u_curr);
-        state.d_u_curr.swap(state.d_u_next);
-
-        // Record receivers (from curr after stencil & rotate)
-        launch_record_receivers(state.d_u_curr.data(), d_traces.data(),
-                                d_rx.data(), d_ry.data(), d_rz.data(),
-                                rec.num_receivers, grid.nx, grid.ny,
-                                t, grid.nt);
+            checkpoints[cp_idx].h_u_prev.resize(N);
+            checkpoints[cp_idx].h_u_curr.resize(N);
+            checkpoints[cp_idx].time_step = t + 1;
+            CUDA_CHECK(cudaMemcpy(checkpoints[cp_idx].h_u_prev.data(),
+                                  state.d_u_prev.data(), bytes, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(checkpoints[cp_idx].h_u_curr.data(),
+                                  state.d_u_curr.data(), bytes, cudaMemcpyDeviceToHost));
+        }
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -139,51 +187,26 @@ void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
     if (h_vel_background) {
         printf("[RTM] Running direct-arrival simulation (homogeneous model)...\n");
 
-        // Save the actual velocity model, load background velocity
+        // Save actual velocity, load background
         CudaBuffer<float> d_vel_actual(N);
         CUDA_CHECK(cudaMemcpy(d_vel_actual.data(), state.d_vel.data(), bytes,
                               cudaMemcpyDeviceToDevice));
         state.d_vel.copyFromHost(h_vel_background, N);
 
-        // Allocate buffer for direct-arrival traces
         CudaBuffer<float> d_traces_direct((size_t)rec.num_receivers * grid.nt);
         d_traces_direct.zero();
 
-        // Re-run forward simulation with homogeneous velocity
         state.d_u_prev.zero();
         state.d_u_curr.zero();
         state.d_u_next.zero();
 
-        int sponge_width = (grid.nx < 64) ? grid.nx / 6 : 20;
         for (int t = 0; t < grid.nt; t++) {
-            // Inject source
-            int src_idx = src.sz * grid.nx * grid.ny + src.sy * grid.nx + src.sx;
-            float val;
-            CUDA_CHECK(cudaMemcpy(&val, state.d_u_curr.data() + src_idx,
-                                  sizeof(float), cudaMemcpyDeviceToHost));
-            val += src.wavelet[t];
-            CUDA_CHECK(cudaMemcpy(state.d_u_curr.data() + src_idx, &val,
-                                  sizeof(float), cudaMemcpyHostToDevice));
-
-            // Stencil + sponge + rotate
-            dispatch_stencil(state.d_u_prev.data(), state.d_u_curr.data(),
-                             state.d_u_next.data(), state.d_vel.data(),
-                             grid.nx, grid.ny, grid.nz, kernel);
-            apply_sponge_boundary(state.d_u_next.data(), grid.nx, grid.ny, grid.nz,
-                                  sponge_width, 0.015f);
-            state.d_u_prev.swap(state.d_u_curr);
-            state.d_u_curr.swap(state.d_u_next);
-
-            // Record at receivers
-            launch_record_receivers(state.d_u_curr.data(), d_traces_direct.data(),
-                                    d_rx.data(), d_ry.data(), d_rz.data(),
-                                    rec.num_receivers, grid.nx, grid.ny,
-                                    t, grid.nt);
+            forward_step(state, grid, src, t, kernel, sponge_width,
+                         &d_traces_direct, &d_rx, &d_ry, &d_rz, rec.num_receivers);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Subtract direct-arrival traces from actual traces on device:
-        //   d_traces = d_traces - d_traces_direct  (reflection-only)
+        // Subtract: d_traces -= d_traces_direct (keep only reflections)
         size_t trace_count = (size_t)rec.num_receivers * grid.nt;
         std::vector<float> h_actual(trace_count), h_direct(trace_count);
         CUDA_CHECK(cudaMemcpy(h_actual.data(), d_traces.data(),
@@ -201,12 +224,12 @@ void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
 
         printf("[RTM] Direct-arrival subtracted. Reflection-only max=%.6e\n", max_diff);
 
-        // Restore actual velocity model
+        // Restore actual velocity
         CUDA_CHECK(cudaMemcpy(state.d_vel.data(), d_vel_actual.data(), bytes,
                               cudaMemcpyDeviceToDevice));
     }
 
-    // PHASE 2: BACKWARD PROPAGATION + IMAGING
+    // PHASE 2: BACKWARD PROPAGATION + IMAGING (checkpoint-based segments)
     printf("[RTM] Backward propagation + imaging...\n");
 
     DeviceState rcv_state;
@@ -218,51 +241,119 @@ void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
     rcv_state.d_u_prev.zero();
     rcv_state.d_u_curr.zero();
     rcv_state.d_u_next.zero();
-
     CUDA_CHECK(cudaMemcpy(rcv_state.d_vel.data(), state.d_vel.data(),
                           bytes, cudaMemcpyDeviceToDevice));
 
-    // Walk backward: t = nt-1, nt-2, ..., 0
-    for (int t = grid.nt - 1; t >= 0; t--) {
-        // 1. Inject receiver trace at time t (time-reversed adjoint source)
-        launch_inject_receivers(rcv_state.d_u_curr.data(), d_traces.data(),
-                                d_rx.data(), d_ry.data(), d_rz.data(),
-                                rec.num_receivers, grid.nx, grid.ny,
-                                t, grid.nt);
+    // Temporary buffer for source snapshots within one segment
+    std::vector<std::vector<float>> seg_snapshots(cp_interval);
 
-        // 2. Load source snapshot at forward time t (BEFORE stencil — matches
-        //    forward pass where snapshots were saved post-inject, pre-stencil)
-        CUDA_CHECK(cudaMemcpy(state.d_u_curr.data(),
-                              src_snapshots[t].data(), bytes,
-                              cudaMemcpyHostToDevice));
+    // Process segments in reverse order
+    int num_segments = (grid.nt + cp_interval - 1) / cp_interval;
 
-        // 3. Imaging condition BEFORE stencil: image += src(t) * rcv(t)
-        //    Both wavefields are post-inject, pre-stencil = same physical time
-        apply_imaging_condition(state.d_u_curr.data(),
-                                rcv_state.d_u_curr.data(),
-                                d_image.data(), N);
+    for (int seg = num_segments - 1; seg >= 0; seg--) {
+        int t_start = seg * cp_interval;
+        int t_end   = std::min(t_start + cp_interval, grid.nt);
+        int seg_len = t_end - t_start;
 
-        // 4. Stencil: propagate backward wavefield
-        dispatch_stencil(rcv_state.d_u_prev.data(), rcv_state.d_u_curr.data(),
-                         rcv_state.d_u_next.data(), rcv_state.d_vel.data(),
-                         grid.nx, grid.ny, grid.nz, kernel);
+        // 1. Restore checkpoint for t_start
+        //    Find the checkpoint at t_start
+        int cp_idx = seg;  // checkpoint[seg] was saved at time = seg * cp_interval
+        CUDA_CHECK(cudaMemcpy(state.d_u_prev.data(), checkpoints[cp_idx].h_u_prev.data(),
+                              bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(state.d_u_curr.data(), checkpoints[cp_idx].h_u_curr.data(),
+                              bytes, cudaMemcpyHostToDevice));
 
-        // 5. Absorbing boundary
-        int sponge_width = (grid.nx < 64) ? grid.nx / 6 : 20;
-        apply_sponge_boundary(rcv_state.d_u_next.data(), grid.nx, grid.ny, grid.nz,
-                              sponge_width, 0.015f);
+        // 2. Re-propagate forward from t_start to t_end, saving source snapshots
+        //    (only seg_len snapshots — fits easily in memory)
+        for (int i = 0; i < seg_len; i++) {
+            int t = t_start + i;
 
-        // 6. Rotate backward buffers
-        rcv_state.d_u_prev.swap(rcv_state.d_u_curr);
-        rcv_state.d_u_curr.swap(rcv_state.d_u_next);
+            // Inject source (must match forward pass exactly)
+            inject_source(state.d_u_curr, src, grid, t);
+
+            // Save source snapshot AFTER inject, BEFORE stencil
+            seg_snapshots[i].resize(N);
+            CUDA_CHECK(cudaMemcpy(seg_snapshots[i].data(), state.d_u_curr.data(),
+                                  bytes, cudaMemcpyDeviceToHost));
+
+            // Stencil + sponge + rotate (no receiver recording needed)
+            dispatch_stencil(state.d_u_prev.data(), state.d_u_curr.data(),
+                             state.d_u_next.data(), state.d_vel.data(),
+                             grid.nx, grid.ny, grid.nz, kernel);
+            apply_sponge_boundary(state.d_u_next.data(), grid.nx, grid.ny, grid.nz,
+                                  sponge_width, 0.015f);
+            state.d_u_prev.swap(state.d_u_curr);
+            state.d_u_curr.swap(state.d_u_next);
+        }
+
+        // 3. Walk backward through this segment: t_end-1 down to t_start
+        for (int t = t_end - 1; t >= t_start; t--) {
+            int i = t - t_start;  // index into seg_snapshots
+
+            // Inject receiver trace (time-reversed adjoint source)
+            launch_inject_receivers(rcv_state.d_u_curr.data(), d_traces.data(),
+                                    d_rx.data(), d_ry.data(), d_rz.data(),
+                                    rec.num_receivers, grid.nx, grid.ny,
+                                    t, grid.nt);
+
+            // Load source snapshot for this time step
+            CUDA_CHECK(cudaMemcpy(state.d_u_curr.data(), seg_snapshots[i].data(),
+                                  bytes, cudaMemcpyHostToDevice));
+
+            // Accumulate source illumination
+            accumulate_source_illumination(state.d_u_curr.data(), d_illum.data(), N);
+
+            // Imaging condition BEFORE stencil (both wavefields at same physical time)
+            apply_imaging_condition(state.d_u_curr.data(),
+                                    rcv_state.d_u_curr.data(),
+                                    d_image.data(), N);
+
+            // Stencil + sponge + rotate backward wavefield
+            dispatch_stencil(rcv_state.d_u_prev.data(), rcv_state.d_u_curr.data(),
+                             rcv_state.d_u_next.data(), rcv_state.d_vel.data(),
+                             grid.nx, grid.ny, grid.nz, kernel);
+            apply_sponge_boundary(rcv_state.d_u_next.data(), grid.nx, grid.ny, grid.nz,
+                                  sponge_width, 0.015f);
+            rcv_state.d_u_prev.swap(rcv_state.d_u_curr);
+            rcv_state.d_u_curr.swap(rcv_state.d_u_next);
+        }
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
     printf("[RTM] Imaging complete.\n");
 
-    // Copy raw cross-correlation image to host (Laplacian filter applied in viewer)
+    // Copy raw cross-correlation image to host
     CUDA_CHECK(cudaMemcpy(h_image, d_image.data(), bytes,
                           cudaMemcpyDeviceToHost));
+
+    // Download illumination map
+    std::vector<float> h_illum(N);
+    CUDA_CHECK(cudaMemcpy(h_illum.data(), d_illum.data(), bytes,
+                          cudaMemcpyDeviceToHost));
+
+    // Find max illumination for stable epsilon
+    float max_illum = 0.0f;
+    for (size_t i = 0; i < N; i++) {
+        if (h_illum[i] > max_illum) max_illum = h_illum[i];
+    }
+    float epsilon = 0.01f * max_illum;
+    if (epsilon < 1e-12f) epsilon = 1e-12f;
+
+    // Apply illumination normalization and source muting
+    int mute_start = src.sz;          // top of mute zone
+    int mute_end   = src.sz + 15;     // bottom of taper
+    for (int z = 0; z < grid.nz; z++) {
+        float mute = 1.0f;
+        if (z <= mute_start) mute = 0.0f;
+        else if (z < mute_end) mute = (float)(z - mute_start) / (mute_end - mute_start);
+        
+        for (int y = 0; y < grid.ny; y++) {
+            for (int x = 0; x < grid.nx; x++) {
+                size_t idx = z * (size_t)grid.nx * grid.ny + y * grid.nx + x;
+                h_image[idx] = (h_image[idx] / (h_illum[idx] + epsilon)) * mute;
+            }
+        }
+    }
 
     // Cleanup
     rcv_state.d_u_prev = CudaBuffer<float>();

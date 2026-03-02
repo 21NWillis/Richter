@@ -33,7 +33,7 @@ def main():
     print(f"  Laplacian: min={img_lap.min():.6e}  max={img_lap.max():.6e}")
 
     # --- Create side-by-side figure ---
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 7), gridspec_kw={'width_ratios': [1, 1, 0.4]})
 
     # Raw cross-correlation
     vmax_raw = np.percentile(np.abs(img), 99)
@@ -58,6 +58,18 @@ def main():
     plt.colorbar(im2, ax=ax2, shrink=0.8)
 
     fig.suptitle('RTM Image — XZ Slice', fontsize=15, fontweight='bold', y=1.01)
+
+    # 1D Depth Profile
+    depth_profile = np.mean(np.abs(img_lap), axis=1)
+    z_axis = np.arange(img.shape[0])
+    ax3.plot(depth_profile, z_axis, 'k-', linewidth=2)
+    ax3.axhline(128, color='red', linestyle='--', alpha=0.5, label='True Reflector (z=128)')
+    ax3.set_ylim(img.shape[0], 0)
+    ax3.set_xlabel('Mean |Amplitude|', fontsize=11)
+    ax3.set_ylabel('Z / Depth (grid points)', fontsize=11)
+    ax3.set_title('Depth Profile (Laplacian)', fontsize=13, fontweight='bold')
+    ax3.legend()
+    ax3.grid(True, alpha=0.4)
     plt.tight_layout()
     plt.savefig('rtm_image.png', dpi=150, bbox_inches='tight')
     print("Saved rtm_image.png")

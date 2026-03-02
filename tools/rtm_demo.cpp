@@ -49,8 +49,8 @@ static void write_npy(const char* filename, const float* data, int rows, int col
 
 int main(int argc, char** argv) {
     // Configuration
-    int N  = 128;           // Grid size (N^3)
-    int cp_interval = 10;   // Checkpoint interval
+    int N  = 256;           // Grid size (N^3)
+    int cp_interval = 50;   // Checkpoint interval
 
     if (argc > 1) N  = atoi(argv[1]);
     if (argc > 3) cp_interval = atoi(argv[3]);
