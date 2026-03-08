@@ -108,6 +108,50 @@ void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
     int sponge_width = (grid.nx < 64) ? grid.nx / 6 : 20;
     int cp_interval = std::max(checkpoint_interval, 1);
 
+    // Auto-scale checkpoint interval to keep memory bounded.
+    // Checkpoints live on host (2 fields each). Snapshots live on GPU if possible
+    // (GPU pool), otherwise on host. Strategy: prefer a cp_interval that keeps
+    // the GPU snapshot pool feasible, so only checkpoints consume host memory.
+    {
+        size_t free_mem = 0, total_mem = 0;
+        cudaMemGetInfo(&free_mem, &total_mem);
+
+        // Estimate VRAM consumed by allocations between now and snapshot pool
+        size_t future_gpu = (size_t)rec.num_receivers * grid.nt * sizeof(float)  // d_traces
+                          + 6 * bytes  // d_image + d_illum + rcv_state (4 fields)
+                          + (size_t)rec.num_receivers * 3 * sizeof(int);  // d_rx/ry/rz
+        size_t est_pool_free = (free_mem > future_gpu) ? free_mem - future_gpu : 0;
+
+        // Max cp where GPU snapshot pool fits (pool must be < 75% of free VRAM)
+        int max_gpu_cp = (est_pool_free > 0) ? (int)(est_pool_free * 3 / (4 * bytes)) : 0;
+
+        // Check if checkpoint memory exceeds host budget (6 GB)
+        size_t cp_budget = (size_t)6 * 1024 * 1024 * 1024;
+        int max_cps = std::max(3, (int)(cp_budget / (2 * bytes)));
+        int needed_cps = (grid.nt + cp_interval - 1) / cp_interval + 1;
+
+        if (needed_cps > max_cps) {
+            int new_cp = (grid.nt + max_cps - 2) / (max_cps - 1);
+
+            // Clamp to max_gpu_cp if possible — keeps GPU pool feasible,
+            // avoiding massive host snapshot allocation
+            if (new_cp > max_gpu_cp && max_gpu_cp > cp_interval) {
+                new_cp = max_gpu_cp;
+            }
+
+            int new_cps = (grid.nt + new_cp - 1) / new_cp + 1;
+            printf("[RTM] Auto-scaling checkpoint interval: %d -> %d "
+                   "(checkpoints: %d -> %d, %.1f GB -> %.1f GB)\n",
+                   cp_interval, new_cp, needed_cps, new_cps,
+                   (float)needed_cps * 2 * bytes / (1024.0f * 1024.0f * 1024.0f),
+                   (float)new_cps * 2 * bytes / (1024.0f * 1024.0f * 1024.0f));
+            if (new_cp <= max_gpu_cp)
+                printf("[RTM] GPU snapshot pool should fit (est. %.0f MB free)\n",
+                       est_pool_free / (1024.0f * 1024.0f));
+            cp_interval = new_cp;
+        }
+    }
+
     // Allocate device receiver buffers
     CudaBuffer<int> d_rx(rec.num_receivers);
     CudaBuffer<int> d_ry(rec.num_receivers);
@@ -245,7 +289,55 @@ void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
                           bytes, cudaMemcpyDeviceToDevice));
 
 
-    std::vector<std::vector<float>> seg_snapshots(cp_interval);
+    // Decide snapshot storage: GPU pool (fast) or host fallback with sub-segments.
+    // GPU pool: single contiguous VRAM allocation, one chunk per segment.
+    // Host fallback: cap snapshot memory at 2 GB, split segments into chunks
+    // and re-propagate from checkpoint for each chunk (trades compute for memory).
+    CudaBuffer<float> d_snapshot_pool;
+    std::vector<std::vector<float>> h_snapshots;
+    bool use_gpu_snapshots = false;
+    int max_snap_slots = cp_interval;  // default: whole segment fits
+
+    {
+        size_t free_mem = 0, total_mem = 0;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        size_t pool_elems = (size_t)cp_interval * N;
+        size_t pool_bytes = pool_elems * sizeof(float);
+
+        // Only attempt GPU pool if it's small enough to likely succeed.
+        // Large failed cudaMalloc calls can corrupt the CUDA driver context on
+        // some systems (especially WSL2), causing crashes on subsequent shots.
+        size_t max_pool_attempt = (size_t)2 * 1024 * 1024 * 1024;  // 2 GB
+        if (pool_bytes <= max_pool_attempt && pool_bytes < free_mem * 3 / 4) {
+            use_gpu_snapshots = CudaBuffer<float>::tryAlloc(d_snapshot_pool, pool_elems);
+            if (!use_gpu_snapshots) {
+                printf("[RTM] GPU snapshot pool alloc failed, falling back to host\n");
+                CUDA_CHECK(cudaDeviceSynchronize());
+            }
+        }
+
+        if (use_gpu_snapshots) {
+            printf("[RTM] Using GPU snapshot pool (%.1f MB, single allocation)\n",
+                   pool_bytes / (1024.0f * 1024.0f));
+        } else {
+            // Cap host snapshot memory at 2 GB
+            size_t snap_budget = (size_t)2 * 1024 * 1024 * 1024;
+            max_snap_slots = std::max(1, std::min(cp_interval, (int)(snap_budget / bytes)));
+            h_snapshots.resize(max_snap_slots);
+
+            if (max_snap_slots < cp_interval) {
+                int num_chunks_est = (cp_interval + max_snap_slots - 1) / max_snap_slots;
+                printf("[RTM] Using host sub-segment fallback: %d snapshot slots, "
+                       "~%d chunks/segment (%.1f MB snapshots, %.1f MB VRAM free)\n",
+                       max_snap_slots, num_chunks_est,
+                       (float)max_snap_slots * bytes / (1024.0f * 1024.0f),
+                       free_mem / (1024.0f * 1024.0f));
+            } else {
+                printf("[RTM] Using host snapshot fallback (%.1f MB)\n",
+                       pool_bytes / (1024.0f * 1024.0f));
+            }
+        }
+    }
 
     // Process segments in reverse order
     int num_segments = (grid.nt + cp_interval - 1) / cp_interval;
@@ -255,63 +347,103 @@ void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
         int t_end   = std::min(t_start + cp_interval, grid.nt);
         int seg_len = t_end - t_start;
 
-        // 1. Restore checkpoint for t_start
-        int cp_idx = seg; 
-        CUDA_CHECK(cudaMemcpy(state.d_u_prev.data(), checkpoints[cp_idx].h_u_prev.data(),
-                              bytes, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(state.d_u_curr.data(), checkpoints[cp_idx].h_u_curr.data(),
-                              bytes, cudaMemcpyHostToDevice));
+        // Determine chunking for this segment
+        int chunk_size = std::min(seg_len, max_snap_slots);
+        int num_chunks = (seg_len + chunk_size - 1) / chunk_size;
 
-        // 2. Re-propagate forward from t_start to t_end, saving source snapshots
-        for (int i = 0; i < seg_len; i++) {
-            int t = t_start + i;
+        // Process chunks in reverse (receiver backward walk is continuous)
+        for (int chunk = num_chunks - 1; chunk >= 0; chunk--) {
+            int c_start = chunk * chunk_size;  // relative to segment start
+            int c_end   = std::min(c_start + chunk_size, seg_len);
+            int c_len   = c_end - c_start;
 
-            // Inject source (must match forward pass exactly)
-            inject_source(state.d_u_curr, src, grid, t);
-
-            seg_snapshots[i].resize(N);
-            CUDA_CHECK(cudaMemcpy(seg_snapshots[i].data(), state.d_u_curr.data(),
-                                  bytes, cudaMemcpyDeviceToHost));
-
-            // Stencil + sponge + rotate (no receiver recording needed)
-            dispatch_stencil(state.d_u_prev.data(), state.d_u_curr.data(),
-                             state.d_u_next.data(), state.d_vel.data(),
-                             grid.nx, grid.ny, grid.nz, kernel);
-            apply_sponge_boundary(state.d_u_next.data(), grid.nx, grid.ny, grid.nz,
-                                  sponge_width, 0.015f);
-            state.d_u_prev.swap(state.d_u_curr);
-            state.d_u_curr.swap(state.d_u_next);
-        }
-
-        // 3. Walk backward through this segment: t_end-1 down to t_start
-        for (int t = t_end - 1; t >= t_start; t--) {
-            int i = t - t_start;  
-
-            launch_inject_receivers(rcv_state.d_u_curr.data(), d_traces.data(),
-                                    d_rx.data(), d_ry.data(), d_rz.data(),
-                                    rec.num_receivers, grid.nx, grid.ny,
-                                    t, grid.nt);
-
-            // Load source snapshot for this time step
-            CUDA_CHECK(cudaMemcpy(state.d_u_curr.data(), seg_snapshots[i].data(),
+            // Restore checkpoint from host (kept alive for all chunks)
+            CUDA_CHECK(cudaMemcpy(state.d_u_prev.data(),
+                                  checkpoints[seg].h_u_prev.data(),
+                                  bytes, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(state.d_u_curr.data(),
+                                  checkpoints[seg].h_u_curr.data(),
                                   bytes, cudaMemcpyHostToDevice));
 
-            // Accumulate source illumination
-            accumulate_source_illumination(state.d_u_curr.data(), d_illum.data(), N);
+            // Fast-forward from segment start to chunk start (no snapshots needed)
+            for (int i = 0; i < c_start; i++) {
+                int t = t_start + i;
+                inject_source(state.d_u_curr, src, grid, t);
+                dispatch_stencil(state.d_u_prev.data(), state.d_u_curr.data(),
+                                 state.d_u_next.data(), state.d_vel.data(),
+                                 grid.nx, grid.ny, grid.nz, kernel);
+                apply_sponge_boundary(state.d_u_next.data(), grid.nx, grid.ny, grid.nz,
+                                      sponge_width, 0.015f);
+                state.d_u_prev.swap(state.d_u_curr);
+                state.d_u_curr.swap(state.d_u_next);
+            }
 
-            apply_imaging_condition(state.d_u_curr.data(),
-                                    rcv_state.d_u_curr.data(),
-                                    d_image.data(), N);
+            // Save snapshots for this chunk
+            for (int i = c_start; i < c_end; i++) {
+                int t = t_start + i;
+                int snap_idx = i - c_start;
 
-            // Stencil + sponge + rotate backward wavefield
-            dispatch_stencil(rcv_state.d_u_prev.data(), rcv_state.d_u_curr.data(),
-                             rcv_state.d_u_next.data(), rcv_state.d_vel.data(),
-                             grid.nx, grid.ny, grid.nz, kernel);
-            apply_sponge_boundary(rcv_state.d_u_next.data(), grid.nx, grid.ny, grid.nz,
-                                  sponge_width, 0.015f);
-            rcv_state.d_u_prev.swap(rcv_state.d_u_curr);
-            rcv_state.d_u_curr.swap(rcv_state.d_u_next);
+                inject_source(state.d_u_curr, src, grid, t);
+
+                if (use_gpu_snapshots) {
+                    CUDA_CHECK(cudaMemcpy(d_snapshot_pool.data() + (size_t)snap_idx * N,
+                                          state.d_u_curr.data(),
+                                          bytes, cudaMemcpyDeviceToDevice));
+                } else {
+                    h_snapshots[snap_idx].resize(N);
+                    CUDA_CHECK(cudaMemcpy(h_snapshots[snap_idx].data(),
+                                          state.d_u_curr.data(),
+                                          bytes, cudaMemcpyDeviceToHost));
+                }
+
+                dispatch_stencil(state.d_u_prev.data(), state.d_u_curr.data(),
+                                 state.d_u_next.data(), state.d_vel.data(),
+                                 grid.nx, grid.ny, grid.nz, kernel);
+                apply_sponge_boundary(state.d_u_next.data(), grid.nx, grid.ny, grid.nz,
+                                      sponge_width, 0.015f);
+                state.d_u_prev.swap(state.d_u_curr);
+                state.d_u_curr.swap(state.d_u_next);
+            }
+
+            // Walk backward through this chunk
+            for (int t = t_start + c_end - 1; t >= t_start + c_start; t--) {
+                int snap_idx = t - (t_start + c_start);
+
+                launch_inject_receivers(rcv_state.d_u_curr.data(), d_traces.data(),
+                                        d_rx.data(), d_ry.data(), d_rz.data(),
+                                        rec.num_receivers, grid.nx, grid.ny,
+                                        t, grid.nt);
+
+                if (use_gpu_snapshots) {
+                    float* snap_ptr = d_snapshot_pool.data() + (size_t)snap_idx * N;
+                    accumulate_source_illumination(snap_ptr, d_illum.data(), N);
+                    apply_imaging_condition(snap_ptr,
+                                            rcv_state.d_u_curr.data(),
+                                            d_image.data(), N);
+                } else {
+                    CUDA_CHECK(cudaMemcpy(state.d_u_curr.data(),
+                                          h_snapshots[snap_idx].data(),
+                                          bytes, cudaMemcpyHostToDevice));
+                    accumulate_source_illumination(state.d_u_curr.data(),
+                                                   d_illum.data(), N);
+                    apply_imaging_condition(state.d_u_curr.data(),
+                                            rcv_state.d_u_curr.data(),
+                                            d_image.data(), N);
+                }
+
+                dispatch_stencil(rcv_state.d_u_prev.data(), rcv_state.d_u_curr.data(),
+                                 rcv_state.d_u_next.data(), rcv_state.d_vel.data(),
+                                 grid.nx, grid.ny, grid.nz, kernel);
+                apply_sponge_boundary(rcv_state.d_u_next.data(), grid.nx, grid.ny, grid.nz,
+                                      sponge_width, 0.015f);
+                rcv_state.d_u_prev.swap(rcv_state.d_u_curr);
+                rcv_state.d_u_curr.swap(rcv_state.d_u_next);
+            }
         }
+
+        // Free checkpoint after all chunks of this segment are processed
+        std::vector<float>().swap(checkpoints[seg].h_u_prev);
+        std::vector<float>().swap(checkpoints[seg].h_u_curr);
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());

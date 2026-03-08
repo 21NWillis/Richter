@@ -48,6 +48,21 @@ public:
     size_t size() const { return m_count; }
     size_t bytes() const { return m_count * sizeof(T); }
 
+    /// Try to allocate without exiting on failure. Returns true on success.
+    static bool tryAlloc(CudaBuffer& buf, size_t count) {
+        T* ptr = nullptr;
+        cudaError_t err = cudaMalloc(&ptr, count * sizeof(T));
+        if (err != cudaSuccess) {
+            cudaGetLastError();  // clear the error
+            return false;
+        }
+        // Free any existing allocation
+        if (buf.m_ptr) cudaFree(buf.m_ptr);
+        buf.m_ptr = ptr;
+        buf.m_count = count;
+        return true;
+    }
+
     void zero() {
         if (m_ptr && m_count > 0) {
             cudaMemset(m_ptr, 0, bytes());

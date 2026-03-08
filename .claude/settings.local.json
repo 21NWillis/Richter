@@ -7,7 +7,10 @@
       "Bash(wsl -e bash -c \"cd /mnt/e/PersonalProjects/Richter && ./build/rtm_demo 64 2>&1\")",
       "Bash(powershell.exe -Command \"Get-ChildItem ''C:\\\\Users\\\\nlwil\\\\AppData\\\\Local\\\\Packages'' -Filter ''ext4.vhdx'' -Recurse -ErrorAction SilentlyContinue | Select-Object FullName, @{N=''SizeGB'';E={[math]::Round\\($_Length/1GB,2\\)}}\")",
       "Bash(powershell.exe -File:*)",
-      "Bash(wsl -e bash -c \"cd /mnt/e/PersonalProjects/Richter && cmake --build build --config Release 2>&1 | tail -5\")"
+      "Bash(wsl -e bash -c \"cd /mnt/e/PersonalProjects/Richter && cmake --build build --config Release 2>&1 | tail -5\")",
+      "Bash(wsl -e bash -c \"cd /mnt/e/PersonalProjects/Richter && cmake --build build --config Release 2>&1 | tail -8\")",
+      "Bash(wsl -e bash -c \"cd /mnt/e/PersonalProjects/Richter && ./build/rtm_demo 64 0 50 2 2>&1\")",
+      "Bash(wsl -e bash -c \"grep MemTotal /proc/meminfo\")"
     ]
   }
 }

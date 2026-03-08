@@ -63,7 +63,8 @@ def main():
     depth_profile = np.mean(np.abs(img_lap), axis=1)
     z_axis = np.arange(img.shape[0])
     ax3.plot(depth_profile, z_axis, 'k-', linewidth=2)
-    ax3.axhline(128, color='red', linestyle='--', alpha=0.5, label='True Reflector (z=128)')
+    reflector_z = img.shape[0] // 2
+    ax3.axhline(reflector_z, color='red', linestyle='--', alpha=0.5, label=f'True Reflector (z={reflector_z})')
     ax3.set_ylim(img.shape[0], 0)
     ax3.set_xlabel('Mean |Amplitude|', fontsize=11)
     ax3.set_ylabel('Z / Depth (grid points)', fontsize=11)
