@@ -54,7 +54,7 @@ void normalize_by_illumination(float* d_image, const float* d_illum,
 
 // ─── RTM Orchestrator ──────────────────────────────────────────────
 
-/// Run full Reverse Time Migration.
+/// Run full Reverse Time Migration for a single shot.
 /// @param grid       simulation domain
 /// @param src        source configuration (with pre-computed wavelet)
 /// @param rec        receivers (positions filled in; traces will be recorded)
@@ -62,7 +62,32 @@ void normalize_by_illumination(float* d_image, const float* d_illum,
 /// @param h_image    output image (host buffer, size = grid.total_points())
 /// @param kernel     which stencil kernel to use
 /// @param checkpoint_interval save source wavefield every N steps (trades compute for memory)
+/// @param h_vel_background  optional homogeneous velocity for direct-arrival subtraction
+/// @param raw_output if true, skip illumination normalization and source muting (for multi-shot stacking)
+/// @param h_illum_out optional host buffer to receive raw illumination map (size = grid.total_points())
 void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
                  DeviceState& state, float* h_image, KernelType kernel,
                  int checkpoint_interval = 10,
-                 const float* h_vel_background = nullptr);
+                 const float* h_vel_background = nullptr,
+                 bool raw_output = false,
+                 float* h_illum_out = nullptr);
+
+/// Run RTM for multiple shots and stack the results.
+/// Accumulates raw cross-correlation images and illumination across all shots,
+/// then applies a single illumination normalization and source muting pass.
+/// @param grid       simulation domain
+/// @param sources    array of source configurations (length = num_shots)
+/// @param num_shots  number of shots to stack
+/// @param rec        receivers (same geometry reused per shot; traces overwritten each shot)
+/// @param state      device state (reused across shots)
+/// @param h_image    output stacked image (host buffer, size = grid.total_points())
+/// @param kernel     which stencil kernel to use
+/// @param checkpoint_interval save source wavefield every N steps
+/// @param h_vel_background  optional homogeneous velocity for direct-arrival subtraction
+void richter_rtm_multishot(const Grid& grid,
+                           const Source* sources, int num_shots,
+                           const ReceiverSet& rec,
+                           DeviceState& state, float* h_image,
+                           KernelType kernel,
+                           int checkpoint_interval = 50,
+                           const float* h_vel_background = nullptr);

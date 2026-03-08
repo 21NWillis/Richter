@@ -50,7 +50,7 @@ static void write_npy(const char* filename, const float* data, int rows, int col
 int main(int argc, char** argv) {
     // Configuration
     int N  = 256;           // Grid size (N^3)
-    int cp_interval = 50;   // Checkpoint interval
+    int cp_interval = 50;
 
     if (argc > 1) N  = atoi(argv[1]);
     if (argc > 3) cp_interval = atoi(argv[3]);
@@ -68,11 +68,12 @@ int main(int argc, char** argv) {
     float grid_speed = DEFAULT_VELOCITY * dt / dx;  // grid points per step
     int round_trip = (int)(2.0f * (reflector_z - src_z) / grid_speed);
     int nt = (int)(round_trip * 1.5f);  // 50% margin
-    if (argc > 2) nt = atoi(argv[2]);   // allow override
+    if (argc > 2 && atoi(argv[2]) > 0) nt = atoi(argv[2]);  // 0 = auto
 
     printf("═══════════════════════════════════════\n");
     printf("  Richter — RTM Demo\n");
-    printf("  Grid: %d³   Steps: %d   CP: %d\n", N, nt, cp_interval);
+    printf("  Grid: %d³   Steps: %d   CP: %d   Shots: %d\n", N, nt, cp_interval,
+           (argc > 4) ? atoi(argv[4]) : 5);
     printf("═══════════════════════════════════════\n\n");
 
     // Velocity Model
@@ -95,13 +96,20 @@ int main(int argc, char** argv) {
     printf("Velocity model: %.0f m/s above z=%d, %.0f m/s below\n",
            v1, reflector_z, v2);
 
-    // Source
+    // Sources — line of shots along x-axis for multi-shot stacking
     std::vector<float> h_wavelet(nt);
     generate_ricker_wavelet(h_wavelet.data(), nt, dt, freq);
 
+    int num_shots = 5;
+    if (argc > 4) num_shots = atoi(argv[4]);
 
-    Source src = { N/2, N/2, src_z, freq, h_wavelet.data() };
-    printf("Source at (%d, %d, %d)\n", src.sx, src.sy, src.sz);
+    int active_x = N - 2 * sponge;  // usable grid width inside sponge
+    std::vector<Source> sources(num_shots);
+    for (int s = 0; s < num_shots; s++) {
+        int sx = sponge + (active_x * (s + 1)) / (num_shots + 1);
+        sources[s] = { sx, N/2, src_z, freq, h_wavelet.data() };
+        printf("Shot %d: source at (%d, %d, %d)\n", s, sources[s].sx, sources[s].sy, sources[s].sz);
+    }
 
     // Receivers
     // 2D grid of receivers at the surface for full aperture coverage
@@ -123,20 +131,21 @@ int main(int argc, char** argv) {
     ReceiverSet rec = { num_rec, rx.data(), ry.data(), rz.data(), traces.data() };
     printf("Receivers: %d x %d grid at z=%d (%d total)\n", rec_nx, rec_ny, src_z, num_rec);
 
-    // Init device state
+    // Init device state (use first source for wavelet upload)
     DeviceState state;
-    richter_init(grid, src, state);
+    richter_init(grid, sources[0], state);
     state.d_vel.copyFromHost(h_vel.data(), total);
 
     // Background velocity (homogeneous, v1 only) for direct-arrival subtraction
     float bg_coeff = v1 * v1 * dt * dt / (dx * dx);
     std::vector<float> h_vel_bg(total, bg_coeff);
 
-    // Run RTM
+    // Run multi-shot RTM
     std::vector<float> h_image(total, 0.0f);
-    printf("\nRunning RTM...\n");
-    richter_rtm(grid, src, rec, state, h_image.data(),
-                KernelType::REGISTER_ROT, cp_interval, h_vel_bg.data());
+    printf("\nRunning multi-shot RTM (%d shots)...\n", num_shots);
+    richter_rtm_multishot(grid, sources.data(), num_shots, rec, state,
+                          h_image.data(), KernelType::REGISTER_ROT,
+                          cp_interval, h_vel_bg.data());
     printf("RTM complete.\n\n");
 
     // Extract XZ slice at y = N/2

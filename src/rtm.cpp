@@ -99,7 +99,9 @@ struct Checkpoint {
 void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
                  DeviceState& state, float* h_image, KernelType kernel,
                  int checkpoint_interval,
-                 const float* h_vel_background)
+                 const float* h_vel_background,
+                 bool raw_output,
+                 float* h_illum_out)
 {
     size_t N = grid.total_points();
     size_t bytes = N * sizeof(float);
@@ -152,7 +154,6 @@ void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
                      &d_traces, &d_rx, &d_ry, &d_rz, rec.num_receivers);
 
         // Save checkpoint after every cp_interval steps
-        // Checkpoint at step t+1 stores the wavefield state AFTER step t completes
         if ((t + 1) % cp_interval == 0 || t == grid.nt - 1) {
             int cp_idx = (t + 1) / cp_interval;
             if (t == grid.nt - 1 && (t + 1) % cp_interval != 0)
@@ -206,7 +207,6 @@ void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Subtract: d_traces -= d_traces_direct (keep only reflections)
         size_t trace_count = (size_t)rec.num_receivers * grid.nt;
         std::vector<float> h_actual(trace_count), h_direct(trace_count);
         CUDA_CHECK(cudaMemcpy(h_actual.data(), d_traces.data(),
@@ -244,7 +244,7 @@ void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
     CUDA_CHECK(cudaMemcpy(rcv_state.d_vel.data(), state.d_vel.data(),
                           bytes, cudaMemcpyDeviceToDevice));
 
-    // Temporary buffer for source snapshots within one segment
+
     std::vector<std::vector<float>> seg_snapshots(cp_interval);
 
     // Process segments in reverse order
@@ -256,22 +256,19 @@ void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
         int seg_len = t_end - t_start;
 
         // 1. Restore checkpoint for t_start
-        //    Find the checkpoint at t_start
-        int cp_idx = seg;  // checkpoint[seg] was saved at time = seg * cp_interval
+        int cp_idx = seg; 
         CUDA_CHECK(cudaMemcpy(state.d_u_prev.data(), checkpoints[cp_idx].h_u_prev.data(),
                               bytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(state.d_u_curr.data(), checkpoints[cp_idx].h_u_curr.data(),
                               bytes, cudaMemcpyHostToDevice));
 
         // 2. Re-propagate forward from t_start to t_end, saving source snapshots
-        //    (only seg_len snapshots — fits easily in memory)
         for (int i = 0; i < seg_len; i++) {
             int t = t_start + i;
 
             // Inject source (must match forward pass exactly)
             inject_source(state.d_u_curr, src, grid, t);
 
-            // Save source snapshot AFTER inject, BEFORE stencil
             seg_snapshots[i].resize(N);
             CUDA_CHECK(cudaMemcpy(seg_snapshots[i].data(), state.d_u_curr.data(),
                                   bytes, cudaMemcpyDeviceToHost));
@@ -288,9 +285,8 @@ void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
 
         // 3. Walk backward through this segment: t_end-1 down to t_start
         for (int t = t_end - 1; t >= t_start; t--) {
-            int i = t - t_start;  // index into seg_snapshots
+            int i = t - t_start;  
 
-            // Inject receiver trace (time-reversed adjoint source)
             launch_inject_receivers(rcv_state.d_u_curr.data(), d_traces.data(),
                                     d_rx.data(), d_ry.data(), d_rz.data(),
                                     rec.num_receivers, grid.nx, grid.ny,
@@ -303,7 +299,6 @@ void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
             // Accumulate source illumination
             accumulate_source_illumination(state.d_u_curr.data(), d_illum.data(), N);
 
-            // Imaging condition BEFORE stencil (both wavefields at same physical time)
             apply_imaging_condition(state.d_u_curr.data(),
                                     rcv_state.d_u_curr.data(),
                                     d_image.data(), N);
@@ -331,26 +326,33 @@ void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
     CUDA_CHECK(cudaMemcpy(h_illum.data(), d_illum.data(), bytes,
                           cudaMemcpyDeviceToHost));
 
-    // Find max illumination for stable epsilon
-    float max_illum = 0.0f;
-    for (size_t i = 0; i < N; i++) {
-        if (h_illum[i] > max_illum) max_illum = h_illum[i];
+    // Copy raw illumination to caller if requested
+    if (h_illum_out) {
+        memcpy(h_illum_out, h_illum.data(), bytes);
     }
-    float epsilon = 0.01f * max_illum;
-    if (epsilon < 1e-12f) epsilon = 1e-12f;
 
-    // Apply illumination normalization and source muting
-    int mute_start = src.sz;          // top of mute zone
-    int mute_end   = src.sz + 15;     // bottom of taper
-    for (int z = 0; z < grid.nz; z++) {
-        float mute = 1.0f;
-        if (z <= mute_start) mute = 0.0f;
-        else if (z < mute_end) mute = (float)(z - mute_start) / (mute_end - mute_start);
-        
-        for (int y = 0; y < grid.ny; y++) {
-            for (int x = 0; x < grid.nx; x++) {
-                size_t idx = z * (size_t)grid.nx * grid.ny + y * grid.nx + x;
-                h_image[idx] = (h_image[idx] / (h_illum[idx] + epsilon)) * mute;
+    if (!raw_output) {
+        // Find max illumination
+        float max_illum = 0.0f;
+        for (size_t i = 0; i < N; i++) {
+            if (h_illum[i] > max_illum) max_illum = h_illum[i];
+        }
+        float epsilon = 0.01f * max_illum;
+        if (epsilon < 1e-12f) epsilon = 1e-12f;
+
+        // Apply illumination normalization and source muting
+        int mute_start = src.sz;
+        int mute_end   = src.sz + 15;
+        for (int z = 0; z < grid.nz; z++) {
+            float mute = 1.0f;
+            if (z <= mute_start) mute = 0.0f;
+            else if (z < mute_end) mute = (float)(z - mute_start) / (mute_end - mute_start);
+
+            for (int y = 0; y < grid.ny; y++) {
+                for (int x = 0; x < grid.nx; x++) {
+                    size_t idx = z * (size_t)grid.nx * grid.ny + y * grid.nx + x;
+                    h_image[idx] = (h_image[idx] / (h_illum[idx] + epsilon)) * mute;
+                }
             }
         }
     }
@@ -360,4 +362,83 @@ void richter_rtm(const Grid& grid, const Source& src, const ReceiverSet& rec,
     rcv_state.d_u_curr = CudaBuffer<float>();
     rcv_state.d_u_next = CudaBuffer<float>();
     rcv_state.d_vel    = CudaBuffer<float>();
+}
+
+// richter_rtm_multishot
+// Run RTM for multiple shots and stack the results. Accumulates raw
+// cross-correlation images and illumination, then normalizes once.
+void richter_rtm_multishot(const Grid& grid,
+                           const Source* sources, int num_shots,
+                           const ReceiverSet& rec,
+                           DeviceState& state, float* h_image,
+                           KernelType kernel,
+                           int checkpoint_interval,
+                           const float* h_vel_background)
+{
+    size_t N = grid.total_points();
+    size_t bytes = N * sizeof(float);
+
+    // Host accumulators for stacking
+    std::vector<float> stacked_image(N, 0.0f);
+    std::vector<float> stacked_illum(N, 0.0f);
+
+    // Per-shot temporary buffers
+    std::vector<float> shot_image(N);
+    std::vector<float> shot_illum(N);
+
+    printf("[RTM Multi-Shot] Stacking %d shots\n", num_shots);
+
+    for (int s = 0; s < num_shots; s++) {
+        printf("\n[RTM Multi-Shot] ═══ Shot %d/%d  src=(%d,%d,%d) ═══\n",
+               s + 1, num_shots, sources[s].sx, sources[s].sy, sources[s].sz);
+
+        // Zero per-shot buffers
+        memset(shot_image.data(), 0, bytes);
+        memset(shot_illum.data(), 0, bytes);
+
+        // Run single-shot RTM in raw mode
+        richter_rtm(grid, sources[s], rec, state, shot_image.data(), kernel,
+                    checkpoint_interval, h_vel_background,
+                    /*raw_output=*/true, /*h_illum_out=*/shot_illum.data());
+
+        // Accumulate into stacked buffers
+        for (size_t i = 0; i < N; i++) {
+            stacked_image[i] += shot_image[i];
+            stacked_illum[i] += shot_illum[i];
+        }
+    }
+
+    printf("\n[RTM Multi-Shot] All shots complete. Normalizing stacked image...\n");
+
+    // Find max cumulative illumination for epsilon
+    float max_illum = 0.0f;
+    for (size_t i = 0; i < N; i++) {
+        if (stacked_illum[i] > max_illum) max_illum = stacked_illum[i];
+    }
+    float epsilon = 0.01f * max_illum;
+    if (epsilon < 1e-12f) epsilon = 1e-12f;
+
+    // Source muting: use shallowest source depth across all shots
+    int mute_src_z = sources[0].sz;
+    for (int s = 1; s < num_shots; s++) {
+        if (sources[s].sz < mute_src_z) mute_src_z = sources[s].sz;
+    }
+    int mute_start = mute_src_z;
+    int mute_end   = mute_src_z + 15;
+
+    // Apply illumination normalization and source muting
+    for (int z = 0; z < grid.nz; z++) {
+        float mute = 1.0f;
+        if (z <= mute_start) mute = 0.0f;
+        else if (z < mute_end) mute = (float)(z - mute_start) / (mute_end - mute_start);
+
+        for (int y = 0; y < grid.ny; y++) {
+            for (int x = 0; x < grid.nx; x++) {
+                size_t idx = z * (size_t)grid.nx * grid.ny + y * grid.nx + x;
+                h_image[idx] = (stacked_image[idx] / (stacked_illum[idx] + epsilon)) * mute;
+            }
+        }
+    }
+
+    printf("[RTM Multi-Shot] Stacking complete (%d shots).\n", num_shots);
 }
