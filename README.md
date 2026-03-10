@@ -12,6 +12,8 @@ Main Kernel is called Hello.cu, because its like a wave. Get it?
 ## Features
 
 - **8th-order finite-difference** 3D acoustic wave equation solver
+- **AVX2 + FMA + OpenMP** CPU kernel for GPU-free operation and cross-architecture benchmarking
+- **Full CPU-only RTM path** — complete multi-shot RTM pipeline using the AVX2+OpenMP stencil, no GPU required
 - **Multi-shot RTM** with cross-correlation imaging condition, illumination normalization, and source muting
 - **Direct-arrival subtraction** using background velocity model
 - **Checkpoint-based backward pass** with adaptive memory management:
@@ -29,6 +31,17 @@ Grid: 512^3 | GPU: RTX 3070
 | Naive Kernel | 8.018 | 128.3 GB/s | 28.6% |
 | SHMem 2.5D Tiling | 8.080 | 129.3 GB/s | 28.9% |
 | **RegRot Sliding Window** | **16.5** | **264.9 GB/s** | **59.1%** |
+
+### CPU Kernel (AVX2 + FMA + OpenMP)
+
+Grid: 512^3 | CPU: Ryzen 7 5700X3D (8C/16T)
+
+| Implementation | GPts/s | Effective BW |
+|----------------|--------|-------------|
+| Serial (scalar)| 0.126  | 2.0 GB/s    |
+| CPU AVX2+OMP   | 0.568  | 9.1 GB/s    |
+
+The AVX2+OMP kernel is **~4.5x faster** than the serial baseline. The GPU Register Rotation kernel is **~131x faster** than serial and **~29x faster** than the optimized CPU path — a direct cross-architecture comparison using the same 8th-order stencil.
 
 **Register Rotation Performance Highlights:**
 - The kernel hits **~93% Hardware Bus Utilization** (416 GB/s), meaning the physical memory bandwidth is fully saturated.
@@ -59,6 +72,10 @@ The CMake build produces several targets:
   - Usage: `./build/rtm_demo [grid_size] [num_timesteps] [checkpoint_interval] [num_shots]`
   - Pass `0` for `num_timesteps` to auto-compute based on round-trip travel time.
   - Example: `./build/rtm_demo 128 0 50 15` — 128^3 grid, 15 shots, auto timesteps
+- `rtm_cpu_demo`: **CPU-only** multi-shot RTM using the AVX2+OpenMP stencil. Same synthetic model and output format as `rtm_demo`, but requires no GPU.
+  - Usage: `./build/rtm_cpu_demo [grid_size] [num_timesteps] [checkpoint_interval] [num_shots]`
+  - Pass `0` for `num_timesteps` to auto-compute based on round-trip travel time.
+  - Example: `./build/rtm_cpu_demo 64 0 10 3` — 64^3 grid, 3 shots, auto timesteps
 - `profile_register`: A standalone target specifically compiled with debug/line info, designed to be run through Nsight Compute (NCU) for profiling the Register Rotation kernel.
 
 ## Visualization Tools
@@ -74,10 +91,15 @@ python tools/view_slice.py slice_xy.npy
 ```
 
 ### Viewing RTM Images
-Use `view_rtm.py` to process and visualize the output from `rtm_demo`. This script applies a Laplacian filter to the raw cross-correlation image, which suppresses the low-frequency source artifacts and enhances the visibility of the reflectors. It also generates a 1D depth profile.
+Use `view_rtm.py` to process and visualize the output from `rtm_demo` or `rtm_cpu_demo`. This script applies a Laplacian filter to the raw cross-correlation image, which suppresses the low-frequency source artifacts and enhances the visibility of the reflectors. It also generates a 1D depth profile.
 
 ```bash
+# GPU path
 ./build/rtm_demo 128 0 50 15
+python tools/view_rtm.py rtm_image.npy
+
+# CPU-only path (no GPU required)
+./build/rtm_cpu_demo 64 0 10 3
 python tools/view_rtm.py rtm_image.npy
 ```
 
@@ -96,6 +118,8 @@ The backward pass snapshot storage adapts to available resources:
 - **GPU snapshot pool**: A single contiguous VRAM allocation holds all snapshots for a segment. Imaging kernels read directly from the pool (zero-copy). Used when the pool fits within 75% of free VRAM.
 - **Host sub-segment fallback**: When VRAM is insufficient, snapshots are stored on host with a capped memory budget (2 GB). Each segment is split into chunks, with the source wavefield re-propagated from the checkpoint for each chunk. This trades ~2-3x more compute for bounded host memory usage.
 - **Auto-scaling**: The checkpoint interval is automatically increased for large grids to keep checkpoint memory within budget while preferring intervals that keep the GPU snapshot pool feasible.
+
+The **CPU-only path** uses the same checkpoint-based algorithm but operates entirely in host memory. Snapshots are stored on host with the same 2 GB budget and sub-segment chunking. Since there are no device transfers, source injection and receiver operations are direct array accesses.
 
 ## Tech Stack
 

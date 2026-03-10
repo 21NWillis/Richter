@@ -27,7 +27,12 @@ set(CORE_SOURCES
     src/model.cpp
     src/wavelet.cpp
     src/rtm.cpp
+    src/rtm_cpu.cpp
+    src/kernels/hello_cpu.cpp
 )
+
+# ─── OpenMP ─────────────────────────────────────────────────────────
+find_package(OpenMP REQUIRED)
 
 # ─── Static library: richter_core ────────────────────────────────────
 add_library(richter_core STATIC
@@ -39,8 +44,12 @@ target_include_directories(richter_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
+target_link_libraries(richter_core PUBLIC OpenMP::OpenMP_CXX)
+
 target_compile_options(richter_core PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -O3 --use_fast_math>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/arch:AVX2 /O2>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-mavx2 -mfma -O3>
 )
 
 # ─── PyBind11 module (optional, only if pybind11 found) ──────────────
@@ -68,6 +77,10 @@ target_link_libraries(snapshot PRIVATE richter_core)
 # ─── RTM demo ───────────────────────────────────────────────────────
 add_executable(rtm_demo tools/rtm_demo.cpp)
 target_link_libraries(rtm_demo PRIVATE richter_core)
+
+# ─── RTM CPU demo (no GPU required) ────────────────────────────────
+add_executable(rtm_cpu_demo tools/rtm_cpu_demo.cpp)
+target_link_libraries(rtm_cpu_demo PRIVATE richter_core)
 
 # ─── Profiling target (standalone for NCU) ──────────────────────────
 add_executable(profile_register tools/profile_kernel.cu)

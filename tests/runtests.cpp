@@ -226,6 +226,48 @@ static bool test_register_vs_cpu() {
     }
 }
 
+// ─── Test: AVX2+OMP CPU Kernel vs CPU Reference ─────────────────────
+static bool test_avx_vs_cpu() {
+    printf("[TEST] AVX2+OMP CPU kernel vs CPU reference... ");
+
+    const int N = 64;
+    size_t total = (size_t)N * N * N;
+
+    std::vector<float> h_prev(total, 0.0f);
+    std::vector<float> h_curr(total, 0.0f);
+    std::vector<float> h_vel(total, 0.0f);
+    std::vector<float> h_cpu_out(total, 0.0f);
+    std::vector<float> h_avx_out(total, 0.0f);
+
+    float coeff = DEFAULT_VELOCITY * DEFAULT_VELOCITY * DEFAULT_DT * DEFAULT_DT
+                / (DEFAULT_DX * DEFAULT_DX);
+    for (size_t i = 0; i < total; i++) {
+        h_curr[i] = sinf((float)i * 0.001f);
+        h_prev[i] = h_curr[i] * 0.99f;
+        h_vel[i]  = coeff;
+    }
+
+    cpu_stencil(h_prev.data(), h_curr.data(), h_cpu_out.data(),
+                h_vel.data(), N, N, N);
+
+    launch_kernel_cpu_avx(h_prev.data(), h_curr.data(), h_avx_out.data(),
+                          h_vel.data(), N, N, N);
+
+    float max_err = 0.0f;
+    for (size_t i = 0; i < total; i++) {
+        float err = fabsf(h_avx_out[i] - h_cpu_out[i]);
+        if (err > max_err) max_err = err;
+    }
+
+    if (max_err < 1e-4f) {
+        printf("PASS (max error: %.2e)\n", max_err);
+        return true;
+    } else {
+        printf("FAIL (max error: %.2e)\n", max_err);
+        return false;
+    }
+}
+
 // ─── Test: Ricker Wavelet ───────────────────────────────────────────
 static bool test_ricker_wavelet() {
     printf("[TEST] Ricker wavelet generation... ");
@@ -456,6 +498,7 @@ int main() {
     total++; if (test_shmem_vs_cpu())         passed++;
     total++; if (test_register_vs_cpu())      passed++;
     total++; if (test_hybrid_vs_cpu())        passed++;
+    total++; if (test_avx_vs_cpu())          passed++;
     total++; if (test_sponge_boundary())      passed++;
     total++; if (test_rtm_flat_reflector())   passed++;
 

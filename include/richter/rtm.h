@@ -4,15 +4,6 @@
 #include "cuda_buffer.h"
 #include <cstddef>
 
-// ─── Receiver Configuration ────────────────────────────────────────
-struct ReceiverSet {
-    int num_receivers;
-    int* rx;           // x-positions (host array, length = num_receivers)
-    int* ry;           // y-positions
-    int* rz;           // z-positions
-    float* traces;     // recorded data [num_receivers × nt] row-major (host)
-};
-
 // ─── Receiver Kernel Wrappers ──────────────────────────────────────
 
 /// Gather pressure at each receiver location and store in trace buffer.

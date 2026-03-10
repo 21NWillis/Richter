@@ -23,3 +23,8 @@ void launch_kernel_register(const float* u_prev, const float* u_curr,
 void launch_kernel_hybrid(const float* u_prev, const float* u_curr,
                           float* u_next, const float* vel,
                           int nx, int ny, int nz);
+
+/// CPU AVX2+FMA+OpenMP — vectorized stencil on host memory.
+void launch_kernel_cpu_avx(const float* u_prev, const float* u_curr,
+                           float* u_next, const float* vel,
+                           int nx, int ny, int nz);

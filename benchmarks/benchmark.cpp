@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <chrono>
 #include "richter/cuda_buffer.h"
 
 struct BenchResult {
@@ -75,6 +76,42 @@ static BenchResult run_benchmark(const char* name,
     return { name, gpts, eff_bw, pct };
 }
 
+static BenchResult run_cpu_benchmark(const char* name,
+                                      void (*launcher)(const float*, const float*,
+                                                       float*, const float*,
+                                                       int, int, int),
+                                      int nx, int ny, int nz,
+                                      int warmup, int iters,
+                                      double peak_bw_gb)
+{
+    size_t total = (size_t)nx * ny * nz;
+
+    std::vector<float> h_prev(total, 0.0f);
+    std::vector<float> h_curr(total, 0.0f);
+    std::vector<float> h_next(total, 0.0f);
+    std::vector<float> h_vel(total, 0.0f);
+
+    // Warmup
+    for (int i = 0; i < warmup; i++) {
+        launcher(h_prev.data(), h_curr.data(), h_next.data(), h_vel.data(), nx, ny, nz);
+    }
+
+    // Timed runs
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; i++) {
+        launcher(h_prev.data(), h_curr.data(), h_next.data(), h_vel.data(), nx, ny, nz);
+    }
+    auto stop = std::chrono::high_resolution_clock::now();
+    double elapsed_s = std::chrono::duration<double>(stop - start).count();
+
+    double bytes_transferred = 4.0 * total * sizeof(float) * iters;
+    double eff_bw = bytes_transferred / elapsed_s / 1e9;
+    double gpts = (double)total * iters / elapsed_s / 1e9;
+    double pct = peak_bw_gb > 0 ? eff_bw / peak_bw_gb * 100.0 : 0.0;
+
+    return { name, gpts, eff_bw, pct };
+}
+
 int main(int argc, char** argv) {
     // Grid size (default 256^3, override with argv)
     int N = 256;
@@ -113,6 +150,21 @@ int main(int argc, char** argv) {
                                  N, N, N, warmup, iters, peak_bw);
     printf("%-20s %10.3f %10.1f GB/s %8.1f%%\n",
            hybrid_result.name, hybrid_result.gpts_per_sec, hybrid_result.effective_bw_gb, hybrid_result.pct_peak);
+
+    printf("\n");
+
+    // CPU benchmark (host memory, chrono timing)
+    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("  CPU Kernel (AVX2 + FMA + OpenMP)\n");
+    printf("═══════════════════════════════════════════════════════════════\n\n");
+
+    printf("%-20s %10s %12s\n", "Kernel", "GPts/s", "Eff BW");
+    printf("────────────────────────────────────────────────────────────\n");
+
+    auto cpu_result = run_cpu_benchmark("CPU AVX2+OMP", launch_kernel_cpu_avx,
+                                         N, N, N, warmup, iters, 0.0);
+    printf("%-20s %10.3f %10.1f GB/s\n",
+           cpu_result.name, cpu_result.gpts_per_sec, cpu_result.effective_bw_gb);
 
     printf("\n");
     return 0;
