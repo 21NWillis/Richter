@@ -26,7 +26,20 @@
       "Bash(wsl -e bash -c \"cd /mnt/e/PersonalProjects/Richter && rm -rf build && mkdir build && cd build && cmake .. -DCMAKE_CUDA_ARCHITECTURES=86 2>&1\")",
       "Bash(wsl -e bash -c \"cd /mnt/e/PersonalProjects/Richter/build && ./runtests 2>&1\")",
       "Bash(wsl -e bash -c \"cd /mnt/e/PersonalProjects/Richter/build && ./rtm_cpu_demo 64 0 10 3 2>&1\")",
-      "Bash(wsl -e bash -c \"cd /mnt/e/PersonalProjects/Richter/build && ./rtm_demo 64 0 10 3 2>&1\")"
+      "Bash(wsl -e bash -c \"cd /mnt/e/PersonalProjects/Richter/build && ./rtm_demo 64 0 10 3 2>&1\")",
+      "Bash(cmake .. -DCMAKE_CUDA_ARCHITECTURES=86)",
+      "Bash(cmake .. -DCMAKE_CUDA_ARCHITECTURES=86 -T \"cuda=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1\")",
+      "Bash(wsl bash:*)",
+      "Bash(cmake --build build --config Release --target fwi_demo)",
+      "Bash(cmake ..)",
+      "Bash(cmake .. -DCMAKE_BUILD_TYPE=Release)",
+      "Read(//mnt/e/PersonalProjects/**)",
+      "Read(//mnt/c/**)",
+      "Bash(wsl -e bash -c \"ls /mnt/e/PersonalProjects/Richter/build/\")",
+      "Bash(wsl -e bash -c \"cd /mnt/e/PersonalProjects/Richter/build && cmake .. -DCMAKE_BUILD_TYPE=Release 2>&1\")",
+      "Bash(wsl -e bash -c \"cd /mnt/e/PersonalProjects/Richter/build && ./fwi_demo 64 4 5 2>&1\")",
+      "Bash(wsl -e bash -c \"cd /mnt/e/PersonalProjects/Richter/build && ./fwi_demo 64 4 10 2>&1\")",
+      "Bash(wsl -e bash -c \"cd /mnt/e/PersonalProjects/Richter/build && ./fwi_demo 128 8 20 2>&1\")"
     ]
   }
 }

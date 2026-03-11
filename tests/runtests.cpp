@@ -5,6 +5,7 @@
 #include "richter/wavelet.h"
 #include "richter/boundary.h"
 #include "richter/config.h"
+#include "richter/fwi.h"
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -485,6 +486,273 @@ static bool test_rtm_flat_reflector() {
     }
 }
 
+// ─── Test: FWI Velocity Conversion Round-Trip ───────────────────────
+// Verify velocity_to_coefficient and coefficient_to_velocity are inverses.
+static bool test_fwi_velocity_conversion() {
+    printf("[TEST] FWI velocity <-> coefficient round-trip... ");
+
+    const int N = 32;
+    size_t total = (size_t)N * N * N;
+    size_t bytes = total * sizeof(float);
+    float dt = DEFAULT_DT;
+    float dx = DEFAULT_DX;
+
+    std::vector<float> h_vel(total);
+    for (size_t i = 0; i < total; i++) {
+        h_vel[i] = 1500.0f + 2000.0f * ((float)i / total);
+    }
+
+    float *d_vel, *d_coeff, *d_vel_back;
+    cudaMalloc(&d_vel, bytes);
+    cudaMalloc(&d_coeff, bytes);
+    cudaMalloc(&d_vel_back, bytes);
+    cudaMemcpy(d_vel, h_vel.data(), bytes, cudaMemcpyHostToDevice);
+
+    velocity_to_coefficient(d_vel, d_coeff, dt, dx, total);
+    coefficient_to_velocity(d_coeff, d_vel_back, dt, dx, total);
+
+    std::vector<float> h_vel_back(total);
+    cudaMemcpy(h_vel_back.data(), d_vel_back, bytes, cudaMemcpyDeviceToHost);
+
+    float max_err = 0.0f;
+    for (size_t i = 0; i < total; i++) {
+        float err = fabsf(h_vel[i] - h_vel_back[i]);
+        if (err > max_err) max_err = err;
+    }
+
+    cudaFree(d_vel); cudaFree(d_coeff); cudaFree(d_vel_back);
+
+    if (max_err < 0.01f) {
+        printf("PASS (max error: %.4f m/s)\n", max_err);
+        return true;
+    } else {
+        printf("FAIL (max error: %.4f m/s)\n", max_err);
+        return false;
+    }
+}
+
+// ─── Test: FWI Residual and Misfit ──────────────────────────────────
+static bool test_fwi_residual_misfit() {
+    printf("[TEST] FWI residual and L2 misfit... ");
+
+    const int n = 1024;
+    std::vector<float> h_syn(n), h_obs(n);
+    for (int i = 0; i < n; i++) {
+        h_syn[i] = sinf((float)i * 0.01f);
+        h_obs[i] = sinf((float)i * 0.01f + 0.1f);
+    }
+
+    float cpu_misfit = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float r = h_syn[i] - h_obs[i];
+        cpu_misfit += r * r;
+    }
+    cpu_misfit *= 0.5f;
+
+    float *d_syn, *d_obs, *d_res;
+    cudaMalloc(&d_syn, n * sizeof(float));
+    cudaMalloc(&d_obs, n * sizeof(float));
+    cudaMalloc(&d_res, n * sizeof(float));
+    cudaMemcpy(d_syn, h_syn.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_obs, h_obs.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+
+    float gpu_misfit = compute_residual_and_misfit(d_syn, d_obs, d_res, 1, n);
+
+    std::vector<float> h_res(n);
+    cudaMemcpy(h_res.data(), d_res, n * sizeof(float), cudaMemcpyDeviceToHost);
+
+    float max_res_err = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float expected = h_syn[i] - h_obs[i];
+        float err = fabsf(h_res[i] - expected);
+        if (err > max_res_err) max_res_err = err;
+    }
+
+    cudaFree(d_syn); cudaFree(d_obs); cudaFree(d_res);
+
+    float misfit_err = fabsf(gpu_misfit - cpu_misfit) / (cpu_misfit + 1e-12f);
+    if (max_res_err < 1e-5f && misfit_err < 1e-3f) {
+        printf("PASS (misfit: cpu=%.6e gpu=%.6e, rel_err=%.2e)\n",
+               cpu_misfit, gpu_misfit, misfit_err);
+        return true;
+    } else {
+        printf("FAIL (residual_err=%.2e, misfit rel_err=%.2e)\n",
+               max_res_err, misfit_err);
+        return false;
+    }
+}
+
+// ─── Test: FWI Velocity Update + Clamping ───────────────────────────
+static bool test_fwi_velocity_update() {
+    printf("[TEST] FWI velocity update with clamping... ");
+
+    const int n = 256;
+    float dt = DEFAULT_DT, dx = DEFAULT_DX;
+    float dt2_dx2 = dt * dt / (dx * dx);
+    float v_min = 1500.0f, v_max = 4000.0f;
+    float c_min = v_min * v_min * dt2_dx2;
+    float c_max = v_max * v_max * dt2_dx2;
+
+    std::vector<float> h_vel(n), h_grad(n);
+    float base_coeff = 2500.0f * 2500.0f * dt2_dx2;
+    for (int i = 0; i < n; i++) {
+        h_vel[i] = base_coeff;
+        h_grad[i] = (i < n/2) ? 1e-3f : -1e-3f;
+    }
+
+    float *d_vel, *d_grad;
+    cudaMalloc(&d_vel, n * sizeof(float));
+    cudaMalloc(&d_grad, n * sizeof(float));
+    cudaMemcpy(d_vel, h_vel.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_grad, h_grad.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+
+    apply_velocity_update(d_vel, d_grad, 1.0f, dt, dx, v_min, v_max, n);
+
+    std::vector<float> h_updated(n);
+    cudaMemcpy(h_updated.data(), d_vel, n * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_vel); cudaFree(d_grad);
+
+    bool pass = true;
+    for (int i = 0; i < n; i++) {
+        if (h_updated[i] < c_min - 1e-10f || h_updated[i] > c_max + 1e-10f) {
+            printf("FAIL (index %d outside bounds)\n", i);
+            pass = false; break;
+        }
+        if (i < n/2 && h_updated[i] >= base_coeff) {
+            printf("FAIL (index %d: expected decrease)\n", i);
+            pass = false; break;
+        }
+        if (i >= n/2 && h_updated[i] <= base_coeff) {
+            printf("FAIL (index %d: expected increase)\n", i);
+            pass = false; break;
+        }
+    }
+
+    if (pass) printf("PASS\n");
+    return pass;
+}
+
+// ─── Test: FWI Gradient Smoothing ───────────────────────────────────
+static bool test_fwi_gradient_smoothing() {
+    printf("[TEST] FWI gradient smoothing... ");
+
+    const int N = 32;
+    size_t total = (size_t)N * N * N;
+    size_t bytes = total * sizeof(float);
+
+    std::vector<float> h_grad(total, 0.0f);
+    int center = (N/2) * N * N + (N/2) * N + N/2;
+    h_grad[center] = 1000.0f;
+    float original_center = h_grad[center];
+
+    float *d_grad, *d_temp;
+    cudaMalloc(&d_grad, bytes);
+    cudaMalloc(&d_temp, bytes);
+    cudaMemcpy(d_grad, h_grad.data(), bytes, cudaMemcpyHostToDevice);
+
+    smooth_gradient_3d(d_grad, d_temp, N, N, N, 2.0f);
+
+    std::vector<float> h_smoothed(total);
+    cudaMemcpy(h_smoothed.data(), d_grad, bytes, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_grad); cudaFree(d_temp);
+
+    bool center_reduced = (h_smoothed[center] < original_center);
+    bool neighbor_nonzero = (h_smoothed[center + 1] > 0.0f);
+    bool no_nan = true;
+    for (size_t i = 0; i < total; i++) {
+        if (h_smoothed[i] != h_smoothed[i]) { no_nan = false; break; }
+    }
+
+    bool pass = center_reduced && neighbor_nonzero && no_nan;
+    if (pass) {
+        printf("PASS (center: %.1f -> %.4f, neighbor: %.4f)\n",
+               original_center, h_smoothed[center], h_smoothed[center + 1]);
+    } else {
+        printf("FAIL (center_reduced=%d, neighbor_nz=%d, no_nan=%d)\n",
+               center_reduced, neighbor_nonzero, no_nan);
+    }
+    return pass;
+}
+
+// ─── Test: FWI Forward-Only Smoke Test ──────────────────────────────
+static bool test_fwi_forward_only() {
+    printf("[TEST] FWI forward-only propagation... ");
+
+    const int N = 48;
+    float dx = DEFAULT_DX, dt = DEFAULT_DT, freq = 15.0f;
+    float v = 2000.0f;
+    int sponge = N / 6;
+    int src_z = sponge + 2;
+
+    float grid_speed = v * dt / dx;
+    int nt = (int)(N / grid_speed);
+
+    Grid grid = { N, N, N, dx, dx, dx, dt, nt };
+    size_t total = grid.total_points();
+
+    float coeff = v * v * dt * dt / (dx * dx);
+    std::vector<float> h_vel(total, coeff);
+
+    std::vector<float> h_wavelet(nt);
+    generate_ricker_wavelet(h_wavelet.data(), nt, dt, freq);
+    Source src = { N/2, N/2, src_z, freq, h_wavelet.data() };
+
+    int num_rec = N / 2;
+    std::vector<int> rx(num_rec), ry(num_rec), rz(num_rec);
+    for (int i = 0; i < num_rec; i++) {
+        rx[i] = sponge + i;
+        ry[i] = N / 2;
+        rz[i] = src_z;
+    }
+
+    DeviceState state;
+    state.d_u_prev = CudaBuffer<float>(total);
+    state.d_u_curr = CudaBuffer<float>(total);
+    state.d_u_next = CudaBuffer<float>(total);
+    state.d_vel    = CudaBuffer<float>(total);
+    state.d_wavelet = CudaBuffer<float>(nt);
+    state.d_vel.copyFromHost(h_vel.data(), total);
+    state.d_wavelet.copyFromHost(h_wavelet.data(), nt);
+
+    CudaBuffer<int> d_rx(num_rec), d_ry(num_rec), d_rz(num_rec);
+    d_rx.copyFromHost(rx.data(), num_rec);
+    d_ry.copyFromHost(ry.data(), num_rec);
+    d_rz.copyFromHost(rz.data(), num_rec);
+
+    CudaBuffer<float> d_syn((size_t)num_rec * nt);
+
+    richter_forward_only(grid, src, state, d_syn, d_rx, d_ry, d_rz,
+                          num_rec, KernelType::REGISTER_ROT);
+
+    std::vector<float> h_syn((size_t)num_rec * nt);
+    cudaMemcpy(h_syn.data(), d_syn.data(), h_syn.size() * sizeof(float),
+               cudaMemcpyDeviceToHost);
+
+    float max_amp = 0.0f;
+    bool has_nan = false;
+    for (size_t i = 0; i < h_syn.size(); i++) {
+        if (h_syn[i] != h_syn[i]) { has_nan = true; break; }
+        float a = fabsf(h_syn[i]);
+        if (a > max_amp) max_amp = a;
+    }
+
+    state.d_u_prev = CudaBuffer<float>();
+    state.d_u_curr = CudaBuffer<float>();
+    state.d_u_next = CudaBuffer<float>();
+    state.d_vel    = CudaBuffer<float>();
+    state.d_wavelet = CudaBuffer<float>();
+
+    if (!has_nan && max_amp > 0.0f) {
+        printf("PASS (max_amp=%.2e, no NaN)\n", max_amp);
+        return true;
+    } else {
+        printf("FAIL (max_amp=%.2e, nan=%d)\n", max_amp, has_nan);
+        return false;
+    }
+}
+
 // ─── Main ───────────────────────────────────────────────────────────
 int main() {
     printf("═══════════════════════════════════════\n");
@@ -501,6 +769,13 @@ int main() {
     total++; if (test_avx_vs_cpu())          passed++;
     total++; if (test_sponge_boundary())      passed++;
     total++; if (test_rtm_flat_reflector())   passed++;
+
+    printf("\n─── FWI Tests ───\n\n");
+    total++; if (test_fwi_velocity_conversion()) passed++;
+    total++; if (test_fwi_residual_misfit())     passed++;
+    total++; if (test_fwi_velocity_update())     passed++;
+    total++; if (test_fwi_gradient_smoothing())  passed++;
+    total++; if (test_fwi_forward_only())        passed++;
 
     printf("\n─── Results: %d/%d passed ───\n", passed, total);
     return (passed == total) ? 0 : 1;

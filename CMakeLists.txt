@@ -21,6 +21,7 @@ set(KERNEL_SOURCES
     src/boundary.cu
     src/receiver.cu
     src/imaging.cu
+    src/fwi_kernels.cu
 )
 
 set(CORE_SOURCES
@@ -28,6 +29,8 @@ set(CORE_SOURCES
     src/wavelet.cpp
     src/rtm.cpp
     src/rtm_cpu.cpp
+    src/fwi.cpp
+    src/fwi_cpu.cpp
     src/kernels/hello_cpu.cpp
 )
 
@@ -81,6 +84,10 @@ target_link_libraries(rtm_demo PRIVATE richter_core)
 # ─── RTM CPU demo (no GPU required) ────────────────────────────────
 add_executable(rtm_cpu_demo tools/rtm_cpu_demo.cpp)
 target_link_libraries(rtm_cpu_demo PRIVATE richter_core)
+
+# ─── FWI demo ──────────────────────────────────────────────────────
+add_executable(fwi_demo tools/fwi_demo.cpp)
+target_link_libraries(fwi_demo PRIVATE richter_core)
 
 # ─── Profiling target (standalone for NCU) ──────────────────────────
 add_executable(profile_register tools/profile_kernel.cu)

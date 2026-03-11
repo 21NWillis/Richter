@@ -82,3 +82,55 @@ void richter_rtm_multishot(const Grid& grid,
                            KernelType kernel,
                            int checkpoint_interval = 50,
                            const float* h_vel_background = nullptr);
+
+// ─── FWI Gradient Helper ─────────────────────────────────────────
+
+/// Compute the FWI gradient for a single shot (device-resident I/O).
+/// Performs forward propagation with checkpointing, records synthetic traces,
+/// computes residual (syn - obs) and L2 misfit, then backward propagation
+/// injecting the residuals and accumulating the cross-correlation gradient.
+///
+/// Unlike richter_rtm, this function:
+/// - Takes traces already on device (no upload/download)
+/// - Keeps gradient on device (no D→H copy)
+/// - Skips illumination normalization and source muting
+/// - Records synthetic traces into d_syn_traces during forward pass
+/// - Computes residual internally between forward and backward phases
+///
+/// @param grid             simulation domain
+/// @param src              source configuration
+/// @param state            device state (velocity must be set; wavefields will be zeroed)
+/// @param d_obs_traces     observed traces on device (input, num_receivers × nt)
+/// @param d_residual       residual buffer (device, num_receivers × nt, written internally)
+/// @param d_syn_traces     synthetic traces recorded during forward pass (device output, num_receivers × nt)
+/// @param d_rx/ry/rz       receiver positions on device
+/// @param num_receivers    number of receivers
+/// @param d_gradient       accumulated gradient (device, not zeroed internally)
+/// @param d_illum          accumulated illumination (device, not zeroed internally)
+/// @param kernel           stencil kernel to use
+/// @param checkpoint_interval  checkpoint interval for memory management
+/// @return                 L2 misfit for this shot (0.5 * ||syn - obs||^2)
+float richter_rtm_gradient_gpu(const Grid& grid, const Source& src,
+                                DeviceState& state,
+                                CudaBuffer<float>& d_obs_traces,
+                                CudaBuffer<float>& d_residual,
+                                CudaBuffer<float>& d_syn_traces,
+                                CudaBuffer<int>& d_rx,
+                                CudaBuffer<int>& d_ry,
+                                CudaBuffer<int>& d_rz,
+                                int num_receivers,
+                                CudaBuffer<float>& d_gradient,
+                                CudaBuffer<float>& d_illum,
+                                KernelType kernel,
+                                int checkpoint_interval);
+
+/// Forward-only propagation for a single shot (for line search misfit evaluation).
+/// Records synthetic traces on device without computing the gradient.
+void richter_forward_only(const Grid& grid, const Source& src,
+                           DeviceState& state,
+                           CudaBuffer<float>& d_syn_traces,
+                           CudaBuffer<int>& d_rx,
+                           CudaBuffer<int>& d_ry,
+                           CudaBuffer<int>& d_rz,
+                           int num_receivers,
+                           KernelType kernel);

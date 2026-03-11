@@ -8,6 +8,7 @@
 // snapshots, then walk backward applying the imaging condition.
 
 #include "richter/rtm.h"
+#include "richter/fwi.h"
 #include "richter/kernels.h"
 #include "richter/wavelet.h"
 #include "richter/boundary.h"
@@ -573,4 +574,279 @@ void richter_rtm_multishot(const Grid& grid,
     }
 
     printf("[RTM Multi-Shot] Stacking complete (%d shots).\n", num_shots);
+}
+
+// ─── FWI Gradient Helper ─────────────────────────────────────────
+// Device-resident variant of richter_rtm for FWI gradient computation.
+// Forward propagation with checkpointing + backward pass with imaging.
+// All I/O stays on device. Gradient and illumination are accumulated
+// (not zeroed internally) so the caller can stack across shots.
+
+float richter_rtm_gradient_gpu(const Grid& grid, const Source& src,
+                                DeviceState& state,
+                                CudaBuffer<float>& d_obs_traces,
+                                CudaBuffer<float>& d_residual,
+                                CudaBuffer<float>& d_syn_traces,
+                                CudaBuffer<int>& d_rx,
+                                CudaBuffer<int>& d_ry,
+                                CudaBuffer<int>& d_rz,
+                                int num_receivers,
+                                CudaBuffer<float>& d_gradient,
+                                CudaBuffer<float>& d_illum,
+                                KernelType kernel,
+                                int checkpoint_interval)
+{
+    size_t N = grid.total_points();
+    size_t bytes = N * sizeof(float);
+    int sponge_width = (grid.nx < 64) ? grid.nx / 6 : 20;
+    int cp_interval = std::max(checkpoint_interval, 1);
+
+    // Auto-scale checkpoint interval (same logic as richter_rtm)
+    {
+        size_t free_mem = 0, total_mem = 0;
+        cudaMemGetInfo(&free_mem, &total_mem);
+
+        size_t future_gpu = (size_t)num_receivers * grid.nt * sizeof(float) * 2  // syn + residual traces
+                          + 6 * bytes
+                          + (size_t)num_receivers * 3 * sizeof(int);
+        size_t est_pool_free = (free_mem > future_gpu) ? free_mem - future_gpu : 0;
+        int max_gpu_cp = (est_pool_free > 0) ? (int)(est_pool_free * 3 / (4 * bytes)) : 0;
+
+        size_t cp_budget = (size_t)6 * 1024 * 1024 * 1024;
+        int max_cps = std::max(3, (int)(cp_budget / (2 * bytes)));
+        int needed_cps = (grid.nt + cp_interval - 1) / cp_interval + 1;
+
+        if (needed_cps > max_cps) {
+            int new_cp = (grid.nt + max_cps - 2) / (max_cps - 1);
+            if (new_cp > max_gpu_cp && max_gpu_cp > cp_interval)
+                new_cp = max_gpu_cp;
+            cp_interval = new_cp;
+        }
+    }
+
+    int num_checkpoints = (grid.nt + cp_interval - 1) / cp_interval + 1;
+
+    // PHASE 1: FORWARD PROPAGATION with checkpointing + synthetic trace recording
+    std::vector<Checkpoint> checkpoints(num_checkpoints);
+
+    state.d_u_prev.zero();
+    state.d_u_curr.zero();
+    state.d_u_next.zero();
+    d_syn_traces.zero();
+
+    checkpoints[0].h_u_prev.resize(N);
+    checkpoints[0].h_u_curr.resize(N);
+    checkpoints[0].time_step = 0;
+    CUDA_CHECK(cudaMemcpy(checkpoints[0].h_u_prev.data(), state.d_u_prev.data(),
+                          bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(checkpoints[0].h_u_curr.data(), state.d_u_curr.data(),
+                          bytes, cudaMemcpyDeviceToHost));
+
+    for (int t = 0; t < grid.nt; t++) {
+        forward_step(state, grid, src, t, kernel, sponge_width,
+                     &d_syn_traces, &d_rx, &d_ry, &d_rz, num_receivers);
+
+        if ((t + 1) % cp_interval == 0 || t == grid.nt - 1) {
+            int cp_idx = (t + 1) / cp_interval;
+            if (t == grid.nt - 1 && (t + 1) % cp_interval != 0)
+                cp_idx = num_checkpoints - 1;
+
+            checkpoints[cp_idx].h_u_prev.resize(N);
+            checkpoints[cp_idx].h_u_curr.resize(N);
+            checkpoints[cp_idx].time_step = t + 1;
+            CUDA_CHECK(cudaMemcpy(checkpoints[cp_idx].h_u_prev.data(),
+                                  state.d_u_prev.data(), bytes, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(checkpoints[cp_idx].h_u_curr.data(),
+                                  state.d_u_curr.data(), bytes, cudaMemcpyDeviceToHost));
+        }
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // PHASE 1.5: COMPUTE RESIDUAL (syn - obs) and L2 misfit
+    float shot_misfit = compute_residual_and_misfit(
+        d_syn_traces.data(), d_obs_traces.data(),
+        d_residual.data(), num_receivers, grid.nt);
+
+    // PHASE 2: BACKWARD PROPAGATION + IMAGING
+    // Uses d_residual for receiver injection
+    DeviceState adj_state;
+    adj_state.d_u_prev = CudaBuffer<float>(N);
+    adj_state.d_u_curr = CudaBuffer<float>(N);
+    adj_state.d_u_next = CudaBuffer<float>(N);
+    adj_state.d_vel    = CudaBuffer<float>(N);
+
+    adj_state.d_u_prev.zero();
+    adj_state.d_u_curr.zero();
+    adj_state.d_u_next.zero();
+    CUDA_CHECK(cudaMemcpy(adj_state.d_vel.data(), state.d_vel.data(),
+                          bytes, cudaMemcpyDeviceToDevice));
+
+    // Snapshot storage strategy (same as richter_rtm)
+    CudaBuffer<float> d_snapshot_pool;
+    std::vector<std::vector<float>> h_snapshots;
+    bool use_gpu_snapshots = false;
+    int max_snap_slots = cp_interval;
+
+    {
+        size_t free_mem = 0, total_mem = 0;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        size_t pool_elems = (size_t)cp_interval * N;
+        size_t pool_bytes = pool_elems * sizeof(float);
+
+        size_t max_pool_attempt = (size_t)2 * 1024 * 1024 * 1024;
+        if (pool_bytes <= max_pool_attempt && pool_bytes < free_mem * 3 / 4) {
+            use_gpu_snapshots = CudaBuffer<float>::tryAlloc(d_snapshot_pool, pool_elems);
+            if (!use_gpu_snapshots) {
+                CUDA_CHECK(cudaDeviceSynchronize());
+            }
+        }
+
+        if (!use_gpu_snapshots) {
+            size_t snap_budget = (size_t)2 * 1024 * 1024 * 1024;
+            max_snap_slots = std::max(1, std::min(cp_interval, (int)(snap_budget / bytes)));
+            h_snapshots.resize(max_snap_slots);
+        }
+    }
+
+    int num_segments = (grid.nt + cp_interval - 1) / cp_interval;
+
+    for (int seg = num_segments - 1; seg >= 0; seg--) {
+        int t_start = seg * cp_interval;
+        int t_end   = std::min(t_start + cp_interval, grid.nt);
+        int seg_len = t_end - t_start;
+
+        int chunk_size = std::min(seg_len, max_snap_slots);
+        int num_chunks = (seg_len + chunk_size - 1) / chunk_size;
+
+        for (int chunk = num_chunks - 1; chunk >= 0; chunk--) {
+            int c_start = chunk * chunk_size;
+            int c_end   = std::min(c_start + chunk_size, seg_len);
+            int c_len   = c_end - c_start;
+
+            // Restore checkpoint
+            CUDA_CHECK(cudaMemcpy(state.d_u_prev.data(),
+                                  checkpoints[seg].h_u_prev.data(),
+                                  bytes, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(state.d_u_curr.data(),
+                                  checkpoints[seg].h_u_curr.data(),
+                                  bytes, cudaMemcpyHostToDevice));
+
+            // Fast-forward to chunk start
+            for (int i = 0; i < c_start; i++) {
+                int t = t_start + i;
+                inject_source(state.d_u_curr, src, grid, t);
+                dispatch_stencil(state.d_u_prev.data(), state.d_u_curr.data(),
+                                 state.d_u_next.data(), state.d_vel.data(),
+                                 grid.nx, grid.ny, grid.nz, kernel);
+                apply_sponge_boundary(state.d_u_next.data(), grid.nx, grid.ny, grid.nz,
+                                      sponge_width, 0.015f);
+                state.d_u_prev.swap(state.d_u_curr);
+                state.d_u_curr.swap(state.d_u_next);
+            }
+
+            // Save snapshots for this chunk
+            for (int i = c_start; i < c_end; i++) {
+                int t = t_start + i;
+                int snap_idx = i - c_start;
+
+                inject_source(state.d_u_curr, src, grid, t);
+
+                if (use_gpu_snapshots) {
+                    CUDA_CHECK(cudaMemcpy(d_snapshot_pool.data() + (size_t)snap_idx * N,
+                                          state.d_u_curr.data(),
+                                          bytes, cudaMemcpyDeviceToDevice));
+                } else {
+                    h_snapshots[snap_idx].resize(N);
+                    CUDA_CHECK(cudaMemcpy(h_snapshots[snap_idx].data(),
+                                          state.d_u_curr.data(),
+                                          bytes, cudaMemcpyDeviceToHost));
+                }
+
+                dispatch_stencil(state.d_u_prev.data(), state.d_u_curr.data(),
+                                 state.d_u_next.data(), state.d_vel.data(),
+                                 grid.nx, grid.ny, grid.nz, kernel);
+                apply_sponge_boundary(state.d_u_next.data(), grid.nx, grid.ny, grid.nz,
+                                      sponge_width, 0.015f);
+                state.d_u_prev.swap(state.d_u_curr);
+                state.d_u_curr.swap(state.d_u_next);
+            }
+
+            // Walk backward through chunk — inject residuals, apply imaging
+            for (int t = t_start + c_end - 1; t >= t_start + c_start; t--) {
+                int snap_idx = t - (t_start + c_start);
+
+                launch_inject_receivers(adj_state.d_u_curr.data(), d_residual.data(),
+                                        d_rx.data(), d_ry.data(), d_rz.data(),
+                                        num_receivers, grid.nx, grid.ny,
+                                        t, grid.nt);
+
+                // Cross-correlation imaging condition for FWI gradient
+                // Uses src * adj (smoother, better for velocity model building)
+                // plus source illumination for normalization
+                if (use_gpu_snapshots) {
+                    float* snap_ptr = d_snapshot_pool.data() + (size_t)snap_idx * N;
+                    apply_imaging_condition(snap_ptr, adj_state.d_u_curr.data(),
+                                           d_gradient.data(), N);
+                    accumulate_source_illumination(snap_ptr, d_illum.data(), N);
+                } else {
+                    CUDA_CHECK(cudaMemcpy(state.d_u_curr.data(),
+                                          h_snapshots[snap_idx].data(),
+                                          bytes, cudaMemcpyHostToDevice));
+                    apply_imaging_condition(state.d_u_curr.data(),
+                                           adj_state.d_u_curr.data(),
+                                           d_gradient.data(), N);
+                    accumulate_source_illumination(state.d_u_curr.data(),
+                                                  d_illum.data(), N);
+                }
+
+                dispatch_stencil(adj_state.d_u_prev.data(), adj_state.d_u_curr.data(),
+                                 adj_state.d_u_next.data(), adj_state.d_vel.data(),
+                                 grid.nx, grid.ny, grid.nz, kernel);
+                apply_sponge_boundary(adj_state.d_u_next.data(), grid.nx, grid.ny, grid.nz,
+                                      sponge_width, 0.015f);
+                adj_state.d_u_prev.swap(adj_state.d_u_curr);
+                adj_state.d_u_curr.swap(adj_state.d_u_next);
+            }
+        }
+
+        std::vector<float>().swap(checkpoints[seg].h_u_prev);
+        std::vector<float>().swap(checkpoints[seg].h_u_curr);
+    }
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Cleanup adjoint state
+    adj_state.d_u_prev = CudaBuffer<float>();
+    adj_state.d_u_curr = CudaBuffer<float>();
+    adj_state.d_u_next = CudaBuffer<float>();
+    adj_state.d_vel    = CudaBuffer<float>();
+
+    return shot_misfit;
+}
+
+// ─── Forward-Only Propagation ────────────────────────────────────
+// For FWI line search: just run forward and record synthetic traces.
+// No checkpointing or backward pass needed.
+
+void richter_forward_only(const Grid& grid, const Source& src,
+                           DeviceState& state,
+                           CudaBuffer<float>& d_syn_traces,
+                           CudaBuffer<int>& d_rx,
+                           CudaBuffer<int>& d_ry,
+                           CudaBuffer<int>& d_rz,
+                           int num_receivers,
+                           KernelType kernel)
+{
+    int sponge_width = (grid.nx < 64) ? grid.nx / 6 : 20;
+
+    state.d_u_prev.zero();
+    state.d_u_curr.zero();
+    state.d_u_next.zero();
+    d_syn_traces.zero();
+
+    for (int t = 0; t < grid.nt; t++) {
+        forward_step(state, grid, src, t, kernel, sponge_width,
+                     &d_syn_traces, &d_rx, &d_ry, &d_rz, num_receivers);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
