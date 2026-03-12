@@ -22,6 +22,7 @@ set(KERNEL_SOURCES
     src/receiver.cu
     src/imaging.cu
     src/fwi_kernels.cu
+    src/fwi_2d_kernels.cu
 )
 
 set(CORE_SOURCES
@@ -31,6 +32,7 @@ set(CORE_SOURCES
     src/rtm_cpu.cpp
     src/fwi.cpp
     src/fwi_cpu.cpp
+    src/fwi_2d.cpp
     src/kernels/hello_cpu.cpp
 )
 
@@ -88,6 +90,10 @@ target_link_libraries(rtm_cpu_demo PRIVATE richter_core)
 # ─── FWI demo ──────────────────────────────────────────────────────
 add_executable(fwi_demo tools/fwi_demo.cpp)
 target_link_libraries(fwi_demo PRIVATE richter_core)
+
+# ─── 2D FWI demo ──────────────────────────────────────────────────
+add_executable(fwi_2d_demo tools/fwi_2d_demo.cpp)
+target_link_libraries(fwi_2d_demo PRIVATE richter_core)
 
 # ─── Profiling target (standalone for NCU) ──────────────────────────
 add_executable(profile_register tools/profile_kernel.cu)
