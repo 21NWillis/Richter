@@ -51,53 +51,68 @@ def main():
     vmin = min(vel_true.min(), vel_init.min(), vel_inv.min())
     vmax = max(vel_true.max(), vel_init.max(), vel_inv.max())
 
-    fig, axes = plt.subplots(2, 3, figsize=(21, 10))
+    # True anomaly (what we want to recover) and model update (what FWI actually changed)
+    true_anomaly = vel_true - vel_init      # the lens perturbation
+    model_update = vel_inv - vel_init       # what FWI resolved
+    anomaly_max = max(np.abs(true_anomaly).max(), np.abs(model_update).max(), 1.0)
 
-    # Row 1: True, Initial, Misfit curve
+    fig, axes = plt.subplots(2, 4, figsize=(28, 10))
+
+    # Row 1: True, Inverted, True Anomaly, Model Update
     im1 = axes[0, 0].imshow(vel_true, cmap='jet', aspect='auto',
                              vmin=vmin, vmax=vmax,
                              extent=[0, nx, nz, 0])
     axes[0, 0].set_title('True Velocity', fontsize=13, fontweight='bold')
-    axes[0, 0].set_xlabel('X (grid points)')
-    axes[0, 0].set_ylabel('Z / Depth (grid points)')
+    axes[0, 0].set_xlabel('X (grid)')
+    axes[0, 0].set_ylabel('Z / Depth (grid)')
     plt.colorbar(im1, ax=axes[0, 0], label='m/s', shrink=0.8)
 
-    im2 = axes[0, 1].imshow(vel_init, cmap='jet', aspect='auto',
+    im2 = axes[0, 1].imshow(vel_inv, cmap='jet', aspect='auto',
                              vmin=vmin, vmax=vmax,
                              extent=[0, nx, nz, 0])
-    axes[0, 1].set_title('Initial Guess', fontsize=13, fontweight='bold')
-    axes[0, 1].set_xlabel('X (grid points)')
-    axes[0, 1].set_ylabel('Z / Depth (grid points)')
+    axes[0, 1].set_title('Inverted Velocity', fontsize=13, fontweight='bold')
+    axes[0, 1].set_xlabel('X (grid)')
+    axes[0, 1].set_ylabel('Z / Depth (grid)')
     plt.colorbar(im2, ax=axes[0, 1], label='m/s', shrink=0.8)
 
-    if has_misfit and misfit is not None and len(misfit) > 0:
-        axes[0, 2].semilogy(np.arange(1, len(misfit) + 1), misfit, 'b-o', markersize=3)
-        axes[0, 2].set_xlabel('Iteration')
-        axes[0, 2].set_ylabel('L2 Misfit')
-        axes[0, 2].set_title('Misfit Convergence', fontsize=13, fontweight='bold')
-        axes[0, 2].grid(True, alpha=0.4)
-    else:
-        axes[0, 2].text(0.5, 0.5, 'No misfit data', ha='center', va='center',
-                        transform=axes[0, 2].transAxes)
-
-    # Row 2: Inverted, Error, Depth profile
-    im3 = axes[1, 0].imshow(vel_inv, cmap='jet', aspect='auto',
-                             vmin=vmin, vmax=vmax,
+    # True anomaly: what we want to recover
+    im3 = axes[0, 2].imshow(true_anomaly, cmap='seismic', aspect='auto',
+                             vmin=-anomaly_max, vmax=anomaly_max,
                              extent=[0, nx, nz, 0])
-    axes[1, 0].set_title('Inverted Velocity', fontsize=13, fontweight='bold')
-    axes[1, 0].set_xlabel('X (grid points)')
-    axes[1, 0].set_ylabel('Z / Depth (grid points)')
-    plt.colorbar(im3, ax=axes[1, 0], label='m/s', shrink=0.8)
+    axes[0, 2].set_title('True Anomaly (True - Initial)', fontsize=13, fontweight='bold')
+    axes[0, 2].set_xlabel('X (grid)')
+    axes[0, 2].set_ylabel('Z / Depth (grid)')
+    plt.colorbar(im3, ax=axes[0, 2], label='m/s', shrink=0.8)
 
+    # Model update: what FWI actually changed
+    im4 = axes[0, 3].imshow(model_update, cmap='seismic', aspect='auto',
+                             vmin=-anomaly_max, vmax=anomaly_max,
+                             extent=[0, nx, nz, 0])
+    axes[0, 3].set_title('Model Update (Inverted - Initial)', fontsize=13, fontweight='bold')
+    axes[0, 3].set_xlabel('X (grid)')
+    axes[0, 3].set_ylabel('Z / Depth (grid)')
+    plt.colorbar(im4, ax=axes[0, 3], label='m/s', shrink=0.8)
+
+    # Row 2: Error, Misfit curve, Depth profile, Recovery %
     err_max = np.percentile(np.abs(vel_error), 99)
     if err_max == 0: err_max = 1.0
-    im4 = axes[1, 1].imshow(vel_error, cmap='seismic', aspect='auto',
+    im5 = axes[1, 0].imshow(vel_error, cmap='seismic', aspect='auto',
                              vmin=-err_max, vmax=err_max,
                              extent=[0, nx, nz, 0])
-    axes[1, 1].set_title('Velocity Error (True - Inverted)', fontsize=13, fontweight='bold')
-    axes[1, 1].set_xlabel('X (grid points)')
-    axes[1, 1].set_ylabel('Z / Depth (grid points)')
-    plt.colorbar(im4, ax=axes[1, 1], label='m/s', shrink=0.8)
+    axes[1, 0].set_title('Velocity Error (True - Inverted)', fontsize=13, fontweight='bold')
+    axes[1, 0].set_xlabel('X (grid)')
+    axes[1, 0].set_ylabel('Z / Depth (grid)')
+    plt.colorbar(im5, ax=axes[1, 0], label='m/s', shrink=0.8)
+
+    if has_misfit and misfit is not None and len(misfit) > 0:
+        axes[1, 1].semilogy(np.arange(1, len(misfit) + 1), misfit, 'b-o', markersize=3)
+        axes[1, 1].set_xlabel('Iteration')
+        axes[1, 1].set_ylabel('L2 Misfit')
+        axes[1, 1].set_title('Misfit Convergence', fontsize=13, fontweight='bold')
+        axes[1, 1].grid(True, alpha=0.4)
+    else:
+        axes[1, 1].text(0.5, 0.5, 'No misfit data', ha='center', va='center',
+                        transform=axes[1, 1].transAxes)
 
     # 1D depth profile comparison (center column)
     x_mid = nx // 2
@@ -107,16 +122,34 @@ def main():
     axes[1, 2].plot(vel_inv[:, x_mid], z_axis, 'r-', linewidth=2, label='Inverted')
     axes[1, 2].set_ylim(nz, 0)
     axes[1, 2].set_xlabel('Velocity (m/s)')
-    axes[1, 2].set_ylabel('Z / Depth (grid points)')
+    axes[1, 2].set_ylabel('Z / Depth (grid)')
     axes[1, 2].set_title('1D Depth Profile (x=center)', fontsize=13, fontweight='bold')
     axes[1, 2].legend(loc='best')
     axes[1, 2].grid(True, alpha=0.4)
 
-    fig.suptitle('2D FWI Result', fontsize=15, fontweight='bold', y=1.01)
+    # 1D anomaly comparison (center column): true anomaly vs model update
+    axes[1, 3].plot(true_anomaly[:, x_mid], z_axis, 'k-', linewidth=2, label='True anomaly')
+    axes[1, 3].plot(model_update[:, x_mid], z_axis, 'r-', linewidth=2, label='FWI update')
+    axes[1, 3].axvline(x=0, color='gray', linestyle=':', alpha=0.5)
+    axes[1, 3].set_ylim(nz, 0)
+    axes[1, 3].set_xlabel('Velocity perturbation (m/s)')
+    axes[1, 3].set_ylabel('Z / Depth (grid)')
+    axes[1, 3].set_title('Anomaly Recovery (x=center)', fontsize=13, fontweight='bold')
+    axes[1, 3].legend(loc='best')
+    axes[1, 3].grid(True, alpha=0.4)
+
+    # Summary stats
+    lens_peak = np.abs(true_anomaly).max()
+    update_at_lens = model_update[true_anomaly == true_anomaly.min()].mean() if lens_peak > 0 else 0
+    recovery_pct = abs(update_at_lens / true_anomaly.min()) * 100 if true_anomaly.min() != 0 else 0
+    fig.suptitle(f'2D FWI Result  |  Max Error: {np.abs(vel_error).max():.0f} m/s  |  '
+                 f'Lens Recovery: {recovery_pct:.0f}%  ({update_at_lens:.0f} / {true_anomaly.min():.0f} m/s)',
+                 fontsize=15, fontweight='bold', y=1.01)
     plt.tight_layout()
     plt.savefig('fwi_2d_result.png', dpi=150, bbox_inches='tight')
-    print("Saved fwi_2d_result.png")
-    plt.show()
+    print(f"Saved fwi_2d_result.png")
+    print(f"Lens recovery: {recovery_pct:.1f}% ({update_at_lens:.0f} / {true_anomaly.min():.0f} m/s)")
+    # plt.show()
 
 if __name__ == '__main__':
     main()

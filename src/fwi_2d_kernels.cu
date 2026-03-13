@@ -519,3 +519,42 @@ void apply_water_mask_2d(float* d_gradient, int nx, int nz, int water_depth)
               (nz + block.y - 1) / block.y);
     water_mask_2d_kernel<<<grid, block>>>(d_gradient, nx, nz, water_depth);
 }
+
+// ─── Layer-Stripping Shallow Freeze ────────────────────────────────
+// Zeros gradient above freeze_depth with a cosine taper to avoid
+// discontinuities. Used to freeze converged shallow velocities and
+// force the optimizer to update deeper features like the lens.
+
+__global__ void shallow_freeze_2d_kernel(float* __restrict__ gradient,
+                                          int nx, int nz,
+                                          int freeze_depth, int taper_width)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int z = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= nx || z >= nz) return;
+
+    if (z < freeze_depth - taper_width) {
+        // Fully frozen
+        gradient[z * nx + x] = 0.0f;
+    } else if (z < freeze_depth) {
+        // Cosine taper: 0 at (freeze_depth - taper_width), 1 at freeze_depth
+        float frac = (float)(z - (freeze_depth - taper_width)) / (float)taper_width;
+        float weight = 0.5f * (1.0f - cosf(3.14159265f * frac));
+        gradient[z * nx + x] *= weight;
+    }
+    // z >= freeze_depth: no change
+}
+
+void apply_shallow_freeze_2d(float* d_gradient, int nx, int nz,
+                              int freeze_depth, int taper_width)
+{
+    if (freeze_depth <= 0) return;
+    if (taper_width < 0) taper_width = 0;
+
+    dim3 block(32, 16);
+    dim3 grid((nx + block.x - 1) / block.x,
+              (nz + block.y - 1) / block.y);
+    shallow_freeze_2d_kernel<<<grid, block>>>(d_gradient, nx, nz,
+                                               freeze_depth, taper_width);
+}

@@ -443,10 +443,16 @@ void richter_fwi_2d(const Grid2D& grid,
         float prev_misfit = -1.0f;
         float step_size = config.initial_step_size;
 
-        // Nonlinear Conjugate Gradient (Fletcher-Reeves) state
+        // L-BFGS state
+        const int lbfgs_m = 7;  // number of correction pairs to store
+        std::vector<std::vector<float>> lbfgs_s(lbfgs_m, std::vector<float>(N, 0.0f));  // s_k = x_{k+1} - x_k
+        std::vector<std::vector<float>> lbfgs_y(lbfgs_m, std::vector<float>(N, 0.0f));  // y_k = g_{k+1} - g_k
+        std::vector<float> lbfgs_rho(lbfgs_m, 0.0f);
+        int lbfgs_count = 0;     // number of stored pairs
+        int lbfgs_oldest = 0;    // ring buffer position
+        std::vector<float> h_prev_grad(N, 0.0f);
+        std::vector<float> h_prev_coeff(N, 0.0f);
         std::vector<float> h_search_dir(N, 0.0f);
-        float prev_grad_norm_sq = 0.0f;
-        int cg_restart_interval = 20;
 
         CudaBuffer<float> d_search_dir(N);
 
@@ -466,6 +472,63 @@ void richter_fwi_2d(const Grid2D& grid,
                     d_gradient, d_illum,
                     config);
                 total_misfit += shot_misfit;
+            }
+
+            // Dump raw gradient (before any preconditioning) at iter 1
+            if (total_iterations == 1) {
+                std::vector<float> h_raw(N);
+                CUDA_CHECK(cudaMemcpy(h_raw.data(), d_gradient.data(), bytes,
+                                      cudaMemcpyDeviceToHost));
+                FILE* rf = fopen("fwi_2d_gradient_raw.npy", "wb");
+                if (rf) {
+                    char hdr[128];
+                    int hl = snprintf(hdr, sizeof(hdr),
+                        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }",
+                        grid.nz, grid.nx);
+                    int total_hdr = 10 + hl + 1;
+                    int pad = 64 - (total_hdr % 64);
+                    if (pad == 64) pad = 0;
+                    int padded = hl + pad + 1;
+                    const unsigned char magic[] = {0x93, 'N', 'U', 'M', 'P', 'Y'};
+                    fwrite(magic, 1, 6, rf);
+                    unsigned char ver[] = {1, 0};
+                    fwrite(ver, 1, 2, rf);
+                    unsigned short phl = (unsigned short)padded;
+                    fwrite(&phl, 2, 1, rf);
+                    fwrite(hdr, 1, hl, rf);
+                    for (int p = 0; p < pad; p++) fputc(' ', rf);
+                    fputc('\n', rf);
+                    fwrite(h_raw.data(), sizeof(float), N, rf);
+                    fclose(rf);
+                    printf("       [DEBUG] Saved RAW gradient to fwi_2d_gradient_raw.npy\n");
+                }
+                // Also dump illumination
+                std::vector<float> h_illum_dump(N);
+                CUDA_CHECK(cudaMemcpy(h_illum_dump.data(), d_illum.data(), bytes,
+                                      cudaMemcpyDeviceToHost));
+                FILE* ilf = fopen("fwi_2d_illumination.npy", "wb");
+                if (ilf) {
+                    char hdr[128];
+                    int hl = snprintf(hdr, sizeof(hdr),
+                        "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }",
+                        grid.nz, grid.nx);
+                    int total_hdr = 10 + hl + 1;
+                    int pad = 64 - (total_hdr % 64);
+                    if (pad == 64) pad = 0;
+                    int padded = hl + pad + 1;
+                    const unsigned char magic[] = {0x93, 'N', 'U', 'M', 'P', 'Y'};
+                    fwrite(magic, 1, 6, ilf);
+                    unsigned char ver[] = {1, 0};
+                    fwrite(ver, 1, 2, ilf);
+                    unsigned short phl = (unsigned short)padded;
+                    fwrite(&phl, 2, 1, ilf);
+                    fwrite(hdr, 1, hl, ilf);
+                    for (int p = 0; p < pad; p++) fputc(' ', ilf);
+                    fputc('\n', ilf);
+                    fwrite(h_illum_dump.data(), sizeof(float), N, ilf);
+                    fclose(ilf);
+                    printf("       [DEBUG] Saved illumination to fwi_2d_illumination.npy\n");
+                }
             }
 
             // Smooth gradient
@@ -502,12 +565,32 @@ void richter_fwi_2d(const Grid2D& grid,
                                               sponge_w);
             }
 
-            // Per-row normalization: equalizes gradient energy across depths
-            // after illumination has fixed lateral bias
-            normalize_gradient_per_row_2d(d_gradient.data(), grid.nx, grid.nz,
-                                          config.water_depth);
+            // Depth scaling: compensate for geometric spreading decay with depth
+            if (config.depth_scale_power > 0.0f) {
+                apply_depth_scaling_2d(d_gradient.data(), grid.nx, grid.nz,
+                                       config.water_depth, config.depth_scale_power);
+            }
 
-            // Download preconditioned gradient for CG + normalization
+            // Layer stripping: freeze shallow velocities after initial convergence
+            // to force the optimizer to modify deeper features (e.g. the lens)
+            bool layer_strip_active = (config.layer_strip_iter > 0 &&
+                                       total_iterations > config.layer_strip_iter);
+            if (layer_strip_active) {
+                if (total_iterations == config.layer_strip_iter + 1) {
+                    printf("       [LAYER STRIP] Activated: freezing z < %d (taper=%d)\n",
+                           config.layer_strip_depth, config.layer_strip_taper);
+                    // Reset L-BFGS state: old curvature history is invalid
+                    std::fill(h_search_dir.begin(), h_search_dir.end(), 0.0f);
+                    lbfgs_count = 0;
+                    lbfgs_oldest = 0;
+                    step_size = config.initial_step_size;
+                }
+                apply_shallow_freeze_2d(d_gradient.data(), grid.nx, grid.nz,
+                                         config.layer_strip_depth,
+                                         config.layer_strip_taper);
+            }
+
+            // Download preconditioned gradient + current model
             std::vector<float> h_grad(N);
             std::vector<float> h_vel(N);
             CUDA_CHECK(cudaMemcpy(h_grad.data(), d_gradient.data(), bytes,
@@ -519,7 +602,6 @@ void richter_fwi_2d(const Grid2D& grid,
             if (total_iterations <= 3 || total_iterations == 10 || total_iterations == 50) {
                 char fname[64];
                 snprintf(fname, sizeof(fname), "fwi_2d_gradient_iter%d.npy", total_iterations);
-                // Simple .npy write inline
                 FILE* gf = fopen(fname, "wb");
                 if (gf) {
                     char hdr[128];
@@ -550,39 +632,93 @@ void richter_fwi_2d(const Grid2D& grid,
                 if (h_vel[i] > max_coeff) max_coeff = h_vel[i];
             }
 
-            // CG beta (Fletcher-Reeves)
-            float grad_norm_sq = 0.0f;
-            for (size_t i = 0; i < N; i++) {
-                grad_norm_sq += h_grad[i] * h_grad[i];
+            // ─── L-BFGS: update correction pairs from previous iteration ───
+            if (iter > 0) {
+                // s = x_curr - x_prev (model difference)
+                // y = g_curr - g_prev (gradient difference)
+                int slot = lbfgs_oldest;
+                float ys = 0.0f;
+                for (size_t i = 0; i < N; i++) {
+                    lbfgs_s[slot][i] = h_vel[i] - h_prev_coeff[i];
+                    lbfgs_y[slot][i] = h_grad[i] - h_prev_grad[i];
+                    ys += lbfgs_s[slot][i] * lbfgs_y[slot][i];
+                }
+
+                if (ys > 1e-30f) {
+                    lbfgs_rho[slot] = 1.0f / ys;
+                    lbfgs_oldest = (lbfgs_oldest + 1) % lbfgs_m;
+                    if (lbfgs_count < lbfgs_m) lbfgs_count++;
+                } else {
+                    // Skip this pair — curvature condition not satisfied
+                    printf("       [L-BFGS] Skipping pair (ys=%.2e)\n", ys);
+                }
             }
 
-            float beta = 0.0f;
-            bool cg_restart = (iter == 0) ||
-                              (iter % cg_restart_interval == 0) ||
-                              (prev_grad_norm_sq < 1e-30f);
-            if (!cg_restart) {
-                beta = grad_norm_sq / prev_grad_norm_sq;
-                if (beta > 5.0f) { beta = 0.0f; cg_restart = true; }
+            // Save current gradient & model for next iteration's s/y computation
+            h_prev_grad = h_grad;
+            h_prev_coeff = h_vel;
+
+            // ─── L-BFGS two-loop recursion ───
+            if (lbfgs_count == 0) {
+                // First iteration: steepest descent
+                for (size_t i = 0; i < N; i++) h_search_dir[i] = h_grad[i];
+                printf("       SD (L-BFGS cold start)\n");
+            } else {
+                // q = gradient
+                std::vector<float> q(h_grad);
+                std::vector<float> alpha(lbfgs_m, 0.0f);
+
+                // First loop: newest to oldest
+                for (int j = lbfgs_count - 1; j >= 0; j--) {
+                    int idx = (lbfgs_oldest - 1 - (lbfgs_count - 1 - j) + lbfgs_m * 2) % lbfgs_m;
+                    float dot = 0.0f;
+                    for (size_t i = 0; i < N; i++) dot += lbfgs_s[idx][i] * q[i];
+                    alpha[j] = lbfgs_rho[idx] * dot;
+                    for (size_t i = 0; i < N; i++) q[i] -= alpha[j] * lbfgs_y[idx][i];
+                }
+
+                // Initial Hessian scaling: gamma = s^T y / y^T y (most recent pair)
+                int newest = (lbfgs_oldest - 1 + lbfgs_m) % lbfgs_m;
+                float yy = 0.0f, sy = 0.0f;
+                for (size_t i = 0; i < N; i++) {
+                    yy += lbfgs_y[newest][i] * lbfgs_y[newest][i];
+                    sy += lbfgs_s[newest][i] * lbfgs_y[newest][i];
+                }
+                float gamma = (yy > 1e-30f) ? sy / yy : 1.0f;
+
+                // r = gamma * q
+                std::vector<float>& r = h_search_dir;
+                for (size_t i = 0; i < N; i++) r[i] = gamma * q[i];
+
+                // Second loop: oldest to newest
+                for (int j = 0; j < lbfgs_count; j++) {
+                    int idx = (lbfgs_oldest - lbfgs_count + j + lbfgs_m * 2) % lbfgs_m;
+                    float dot = 0.0f;
+                    for (size_t i = 0; i < N; i++) dot += lbfgs_y[idx][i] * r[i];
+                    float beta_j = lbfgs_rho[idx] * dot;
+                    for (size_t i = 0; i < N; i++) r[i] += (alpha[j] - beta_j) * lbfgs_s[idx][i];
+                }
+
+                printf("       L-BFGS (m=%d, gamma=%.3e)\n", lbfgs_count, gamma);
             }
 
-            // Search direction: p = g + beta * p_old
-            for (size_t i = 0; i < N; i++) {
-                h_search_dir[i] = h_grad[i] + beta * h_search_dir[i];
-            }
-
-            // Descent check
+            // Descent check — fall back to steepest descent if needed
             float descent_check = 0.0f;
             for (size_t i = 0; i < N; i++) {
                 descent_check += h_grad[i] * h_search_dir[i];
             }
             if (descent_check <= 0.0f) {
                 for (size_t i = 0; i < N; i++) h_search_dir[i] = h_grad[i];
-                beta = 0.0f; cg_restart = true;
+                printf("       [L-BFGS] Non-descent direction, falling back to SD\n");
+                // Reset L-BFGS history
+                lbfgs_count = 0;
+                lbfgs_oldest = 0;
             }
 
-            prev_grad_norm_sq = grad_norm_sq;
-
-            // Global L∞ normalization
+            // Direction normalization
+            // For SD: scale to max_coeff so step_size is a fraction of model magnitude
+            // For L-BFGS: scale to max_coeff but preserve relative structure
+            // (L-BFGS already incorporates curvature via gamma and the two-loop recursion)
             float max_abs_dir = 0.0f;
             for (size_t i = 0; i < N; i++) {
                 float a = fabsf(h_search_dir[i]);
@@ -594,8 +730,7 @@ void richter_fwi_2d(const Grid2D& grid,
             int cz = wd + (grid.nz - wd) / 3;
             size_t center_idx = (size_t)cz * grid.nx + cx;
             float dir_center = (center_idx < N) ? fabsf(h_search_dir[center_idx]) : 0.0f;
-            printf("       %s beta=%.3f  |dir|: max=%.3e  lens=%.3e  ratio=%.4f\n",
-                   cg_restart ? "SD" : "CG", beta,
+            printf("       |dir|: max=%.3e  lens=%.3e  ratio=%.4f\n",
                    max_abs_dir, dir_center,
                    max_abs_dir > 0 ? dir_center / max_abs_dir : 0.0f);
 
@@ -603,6 +738,10 @@ void richter_fwi_2d(const Grid2D& grid,
                 float scale = max_coeff / max_abs_dir;
                 for (size_t i = 0; i < N; i++) h_search_dir[i] *= scale;
             }
+
+            // Reset step size each iteration — prevents shrinkage death spiral
+            // where step shrinks to 1e-8 and takes 20+ iterations to recover
+            step_size = config.initial_step_size;
 
             CUDA_CHECK(cudaMemcpy(d_search_dir.data(), h_search_dir.data(), bytes,
                                   cudaMemcpyHostToDevice));
@@ -631,8 +770,6 @@ void richter_fwi_2d(const Grid2D& grid,
                     accepted = true;
                     accepted_misfit = trial_misfit;
                     accepted_step = step_size;
-                    step_size = std::min(step_size / config.step_size_reduction,
-                                         config.initial_step_size);
                     break;
                 }
                 step_size *= config.step_size_reduction;
@@ -642,8 +779,10 @@ void richter_fwi_2d(const Grid2D& grid,
                 CUDA_CHECK(cudaMemcpy(state.d_vel.data(), d_vel_backup.data(),
                                       bytes, cudaMemcpyDeviceToDevice));
                 std::fill(h_search_dir.begin(), h_search_dir.end(), 0.0f);
-                prev_grad_norm_sq = 0.0f;
-                printf("[FWI2D] Iter %d: line search failed. misfit=%.6e (reset CG)\n",
+                // Reset L-BFGS history on line search failure
+                lbfgs_count = 0;
+                lbfgs_oldest = 0;
+                printf("[FWI2D] Iter %d: line search failed. misfit=%.6e (reset L-BFGS)\n",
                        total_iterations, total_misfit);
             } else {
                 printf("[FWI2D] Iter %d: misfit=%.6e -> %.6e  step=%.2e\n",

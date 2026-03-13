@@ -58,6 +58,11 @@ struct FWIConfig2D {
     // Depth gradient scaling
     float depth_scale_power;         // gradient *= (z/active_depth)^power, 0 = disabled
 
+    // Layer stripping: freeze shallow velocities after initial convergence
+    int layer_strip_iter;            // iteration to activate shallow freeze (0 = disabled)
+    int layer_strip_depth;           // freeze gradient above this depth (grid points)
+    int layer_strip_taper;           // cosine taper width at the freeze boundary (grid points)
+
     // Multi-scale frequency schedule
     int num_frequency_stages;
     const float* frequency_stages;
@@ -148,6 +153,10 @@ void normalize_gradient_per_row_2d(float* d_gradient, int nx, int nz,
 // power=1.0 for linear scaling, power=2.0 for quadratic.
 void apply_depth_scaling_2d(float* d_gradient, int nx, int nz,
                              int water_depth, float power);
+
+// Layer-stripping shallow freeze: zero gradient above freeze_depth with cosine taper
+void apply_shallow_freeze_2d(float* d_gradient, int nx, int nz,
+                              int freeze_depth, int taper_width);
 
 // ─── Reused from 3D (flat-array operations) ─────────────────────
 // These work unchanged for 2D since they operate on flat arrays:
